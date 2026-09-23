@@ -1,0 +1,21 @@
+# Build artifacts
+*.exe
+*.obj
+*.o
+*.so
+*.dll
+*.dylib
+*.a
+*.lib
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+
+# IDE
+.vs/
+.vscode/
+.idea/
+.DS_Store
