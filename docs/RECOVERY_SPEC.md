@@ -7,8 +7,8 @@ implemented recovery system is a foundation for future crash recovery. It
 analyzes WAL records, creates a recovery plan, and provides an idempotent
 execution scaffold.
 
-The current implementation does not yet perform full page redo, page undo, MVCC
-visibility restoration, or committed transaction reconstruction.
+The current implementation replays full page images for committed and
+incomplete transactions. MVCC visibility restoration is not implemented.
 
 ## Recovery Pipeline
 
@@ -69,6 +69,8 @@ Current guarantees:
 - idempotency by LSN
 - safe skipping of non-executable recovery actions
 - explicit execution result counters
+- committed `PageImageWritten` records restore their after-image
+- incomplete `PageImageWritten` records restore their before-image in reverse order
 
 ## Recovery Action Types
 
@@ -89,6 +91,7 @@ Current guarantees:
 | `PageAllocated` | `RedoCandidate` |
 | `PageFreed` | `RedoCandidate` |
 | `PageWritten` | `RedoCandidate` |
+| `PageImageWritten` | redo if committed; undo if incomplete; ignore if rolled back |
 | `MetadataUpdated` | `MetadataRefresh` |
 | `Checkpoint` | `CheckpointBoundary` |
 | `RecoveryMarker` | `RecoveryMarker` |
@@ -139,8 +142,7 @@ The future crash recovery algorithm should:
 
 ## Current Limitations
 
-- No transaction table reconstruction yet.
-- No page before-image or after-image application yet.
+- Allocation, free and metadata WAL records do not yet contain physical images.
 - No MVCC cleanup or version pruning.
 - No dirty page table.
 - No durable recovery marker policy.

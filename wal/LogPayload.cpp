@@ -1,5 +1,6 @@
 #include "wal/LogPayload.hpp"
 
+#include "storage/Page.hpp"
 #include "storage/BinaryIO.hpp"
 
 #include <stdexcept>
@@ -28,6 +29,14 @@ void ensureFullyRead(std::span<const Byte> bytes, std::size_t offset) {
 void ensurePageId(PageId pageId) {
   if (pageId == 0) {
     throw std::invalid_argument("WAL payload contains an invalid page id");
+  }
+}
+
+void validatePageImage(const std::array<Byte, kDefaultPageSize>& image, PageId pageId) {
+  Page page;
+  page.deserialize(image);
+  if (page.header().version != Page::kFormatVersionV2 || page.header().pageId != pageId) {
+    throw std::invalid_argument("Page image must be a matching v2 page");
   }
 }
 
@@ -128,6 +137,54 @@ PageWrittenPayload LogPayloadCodec::decodePageWritten(std::span<const Byte> byte
   payload.pageVersion = binary::readLittleEndian<std::uint32_t>(bytes, offset);
   payload.ownerTableId = binary::readLittleEndian<std::uint64_t>(bytes, offset);
   ensureFullyRead(bytes, offset);
+  return payload;
+}
+
+std::vector<Byte> LogPayloadCodec::encodePageImageWritten(const PageImageWrittenPayload& payload) {
+  if (!payload.transactionId.valid()) {
+    throw std::invalid_argument("Page image WAL payload contains an invalid transaction id");
+  }
+  if (payload.pageFormatVersion != Page::kFormatVersionV2) {
+    throw std::invalid_argument("Page image WAL payload requires page format v2");
+  }
+  validatePageImage(payload.beforeImage, payload.pageId);
+  validatePageImage(payload.afterImage, payload.pageId);
+
+  std::vector<Byte> bytes;
+  bytes.reserve(kPageImageWrittenPayloadSize);
+  appendVersion(bytes);
+  binary::appendLittleEndian<std::uint64_t>(bytes, payload.transactionId.value());
+  binary::appendLittleEndian<PageId>(bytes, payload.pageId);
+  binary::appendLittleEndian<std::uint64_t>(bytes, payload.previousTxLsn);
+  binary::appendLittleEndian<std::uint32_t>(bytes, payload.pageFormatVersion);
+  bytes.insert(bytes.end(), payload.beforeImage.begin(), payload.beforeImage.end());
+  bytes.insert(bytes.end(), payload.afterImage.begin(), payload.afterImage.end());
+  return bytes;
+}
+
+PageImageWrittenPayload LogPayloadCodec::decodePageImageWritten(std::span<const Byte> bytes) {
+  if (bytes.size() != kPageImageWrittenPayloadSize) {
+    throw std::invalid_argument("Invalid page image WAL payload size");
+  }
+
+  std::size_t offset = 0;
+  validateVersion(bytes, offset);
+  PageImageWrittenPayload payload;
+  payload.transactionId = TransactionId{binary::readLittleEndian<std::uint64_t>(bytes, offset)};
+  if (!payload.transactionId.valid()) {
+    throw std::invalid_argument("Page image WAL payload contains an invalid transaction id");
+  }
+  payload.pageId = binary::readLittleEndian<PageId>(bytes, offset);
+  payload.previousTxLsn = binary::readLittleEndian<std::uint64_t>(bytes, offset);
+  payload.pageFormatVersion = binary::readLittleEndian<std::uint32_t>(bytes, offset);
+  if (payload.pageFormatVersion != Page::kFormatVersionV2) {
+    throw std::invalid_argument("Unsupported page image format version");
+  }
+  binary::readBytes(bytes, offset, payload.beforeImage);
+  binary::readBytes(bytes, offset, payload.afterImage);
+  ensureFullyRead(bytes, offset);
+  validatePageImage(payload.beforeImage, payload.pageId);
+  validatePageImage(payload.afterImage, payload.pageId);
   return payload;
 }
 

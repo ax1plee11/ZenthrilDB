@@ -107,24 +107,13 @@ Page FileManager::readPage(PageId pageId) {
   }
 
   page.deserialize(bytes);
-  auto checksumPage = page;
-  checksumPage.header().checksum = 0;
-  const auto serialized = checksumPage.serialize();
-  const auto actualChecksum = CRCManager::compute(std::span<const Byte>(serialized.data(), serialized.size()));
-  if (actualChecksum != page.header().checksum) {
-    throw std::runtime_error("Page checksum verification failed");
-  }
   return page;
 }
 
 void FileManager::writePage(const Page& page) {
   std::lock_guard lock(mutex_);
   ensureOpen();
-  auto pageToWrite = page;
-  pageToWrite.header().checksum = 0;
-  const auto checksumBytes = pageToWrite.serialize();
-  pageToWrite.header().checksum = CRCManager::compute(std::span<const Byte>(checksumBytes.data(), checksumBytes.size()));
-  const auto bytes = pageToWrite.serialize();
+  const auto bytes = page.serialize();
   fileStream_.seekp(pageOffset(page.header().pageId));
   if (!fileStream_) {
     throw std::runtime_error("Failed to seek for page write");

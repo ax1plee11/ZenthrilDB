@@ -3,7 +3,19 @@
 #include "storage/BinaryIO.hpp"
 
 #include <array>
+#include <cerrno>
 #include <stdexcept>
+#include <system_error>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace zenthrildb {
 
@@ -94,6 +106,37 @@ void WriteAheadLog::flush() {
   std::lock_guard lock(mutex_);
   ensureOpen();
   stream_.flush();
+  if (!stream_) {
+    throw std::runtime_error("Failed to flush WAL stream");
+  }
+
+#ifdef _WIN32
+  const auto handle = CreateFileW(path_.c_str(), GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                            "Failed to open WAL for durable flush");
+  }
+  const auto flushed = FlushFileBuffers(handle);
+  const auto error = flushed ? ERROR_SUCCESS : GetLastError();
+  CloseHandle(handle);
+  if (!flushed) {
+    throw std::system_error(static_cast<int>(error), std::system_category(),
+                            "Failed to durably flush WAL");
+  }
+#else
+  const auto descriptor = ::open(path_.c_str(), O_RDWR);
+  if (descriptor == -1) {
+    throw std::system_error(errno, std::generic_category(), "Failed to open WAL for durable flush");
+  }
+  const auto flushed = ::fsync(descriptor);
+  const auto error = errno;
+  ::close(descriptor);
+  if (flushed == -1) {
+    throw std::system_error(error, std::generic_category(), "Failed to durably flush WAL");
+  }
+#endif
 }
 
 void WriteAheadLog::truncate(LogSequenceNumber inclusiveMaxLsn) {

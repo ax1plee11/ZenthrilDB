@@ -24,15 +24,20 @@ RecoveryExecutionResult UndoRedoRecoveryExecutor::execute(const RecoveryPlan& pl
       continue;
     }
 
-    if (action.actionType == RecoveryActionType::UndoCandidate) {
-      undoApplier_.applyUndo(action);
-      ++result.undoApplied;
-      result.lastAppliedLsn = action.lsn;
-      rememberApplied(action.lsn);
+    if (action.actionType != RecoveryActionType::UndoCandidate) {
+      ++result.skipped;
+    }
+  }
+
+  for (auto it = plan.actions().rbegin(); it != plan.actions().rend(); ++it) {
+    const auto& action = *it;
+    if (action.actionType != RecoveryActionType::UndoCandidate || alreadyApplied(action.lsn)) {
       continue;
     }
-
-    ++result.skipped;
+    undoApplier_.applyUndo(action);
+    ++result.undoApplied;
+    result.lastAppliedLsn = action.lsn;
+    rememberApplied(action.lsn);
   }
 
   return result;

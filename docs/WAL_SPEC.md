@@ -67,6 +67,7 @@ larger payload sizes before allocating payload buffers.
 | `9` | `TransactionStarted` | transaction boundary |
 | `10` | `TransactionCommitted` | transaction boundary |
 | `11` | `TransactionRolledBack` | transaction boundary |
+| `12` | `PageImageWritten` | full before/after page image for physical recovery |
 
 ## Typed Payload Version
 
@@ -143,6 +144,14 @@ Known metadata kinds:
 | `3` | `FreePageList` |
 | `4` | `TableRegistry` |
 
+## PageImageWritten Payload
+
+Used by `PageImageWritten` for transactional physical recovery. It contains the
+transaction ID, page ID, previous transaction LSN, page-format version, and
+two complete 8192-byte, CRC-protected page images: the state before and after
+the change. During recovery, committed transactions redo the after-image and
+incomplete transactions undo the before-image in reverse LSN order.
+
 ## Transaction Payload
 
 Used by:
@@ -173,7 +182,8 @@ Used by:
 
 ## Current Limitations
 
-- WAL contains physical/logical event metadata, not full before-images or after-images.
-- Full crash recovery is not yet implemented.
+- Page-image recovery currently covers page modifications recorded as
+  `PageImageWritten`; allocation, freeing and metadata operations still need
+  physical recovery records.
 - WAL truncation exists as an infrastructure primitive and must be used carefully until checkpoint durability rules are finalized.
 - Existing `.wal` files produced before explicit little-endian WAL frame encoding are not guaranteed to be portable across architectures.

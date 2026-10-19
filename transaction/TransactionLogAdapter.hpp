@@ -4,9 +4,16 @@
 #include "transaction/TransactionId.hpp"
 #include "wal/LogManager.hpp"
 
+#include <stdexcept>
 #include <vector>
 
 namespace zenthrildb {
+
+class CommitOutcomeUnknown final : public std::runtime_error {
+public:
+  CommitOutcomeUnknown()
+    : std::runtime_error("Commit record was appended but WAL durability is unknown") {}
+};
 
 class TransactionLogAdapter {
 public:

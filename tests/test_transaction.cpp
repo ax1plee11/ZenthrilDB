@@ -27,6 +27,24 @@ std::filesystem::path tempTransactionWalPath(const char* name) {
 
 void test_transaction() {
   {
+    const auto path = tempTransactionWalPath("zenthrildb_transaction_id_reopen.wal");
+    {
+      LogManager log(path);
+      TransactionManager transactions(log);
+      const auto first = transactions.begin();
+      transactions.commit(first.id());
+    }
+    {
+      LogManager log(path);
+      TransactionManager transactions(log);
+      const auto next = transactions.begin();
+      assert(next.id() == TransactionId{2});
+      transactions.rollback(next.id());
+    }
+    std::filesystem::remove(path);
+  }
+
+  {
     const auto path = tempTransactionWalPath("zenthrildb_transaction_lifecycle.wal");
     {
       LogManager log(path);

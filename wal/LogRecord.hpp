@@ -23,6 +23,7 @@ enum class LogRecordType : std::uint32_t {
   TransactionStarted = 9,
   TransactionCommitted = 10,
   TransactionRolledBack = 11,
+  PageImageWritten = 12,
 };
 
 class LogRecord {

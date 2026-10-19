@@ -24,6 +24,7 @@ add_library(zenthrildb_core
   wal/RecoveryContext.cpp
   wal/WriteAheadLog.cpp
   recovery/CheckpointService.cpp
+  recovery/PageImageRecoveryApplier.cpp
   recovery/RecoveryEngine.cpp
   recovery/RecoveryExecutor.cpp
   recovery/RecoveryPlan.cpp

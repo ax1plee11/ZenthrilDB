@@ -1,7 +1,10 @@
 #include "wal/LogPayload.hpp"
 #include "wal/LogManager.hpp"
+#include "wal/LogRecord.hpp"
 #include "transaction/TransactionLogAdapter.hpp"
+#include "storage/Page.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <filesystem>
 #include <thread>
@@ -63,6 +66,135 @@ void test_log_payload() {
     assert(restored.usedBytes == 128);
     assert(restored.pageVersion == 3);
     assert(restored.ownerTableId == 9);
+  }
+
+  {
+    Page before;
+    before.header().version = Page::kFormatVersionV2;
+    before.header().pageId = 0x01020304;
+    before.header().pageType = PageType::Table;
+    before.header().usedBytes = 3;
+    before.payload()[0] = 0x11;
+    before.payload()[1] = 0x22;
+    before.payload()[2] = 0x33;
+    before.setPageLsn(100);
+
+    Page after = before;
+    after.header().usedBytes = 4;
+    after.payload()[3] = 0x44;
+    after.setPageLsn(101);
+
+    const PageImageWrittenPayload source{
+      .transactionId = TransactionId{7001},
+      .pageId = 0x01020304,
+      .previousTxLsn = 88,
+      .pageFormatVersion = Page::kFormatVersionV2,
+      .beforeImage = before.serialize(),
+      .afterImage = after.serialize(),
+    };
+    const auto bytes = LogPayloadCodec::encodePageImageWritten(source);
+    assert(bytes.size() == 16412);
+    assert(bytes[0] == 1);
+    assert(bytes[4] == 0x59);
+    assert(bytes[5] == 0x1B);
+    assert(bytes[12] == 0x04);
+    assert(bytes[13] == 0x03);
+    assert(bytes[14] == 0x02);
+    assert(bytes[15] == 0x01);
+    assert(bytes[16] == 0x58);
+    assert(bytes[24] == Page::kFormatVersionV2);
+    assert(bytes[28 + Page::kV2PageLsnOffset] == 100);
+    assert(bytes[28 + kDefaultPageSize + Page::kV2PageLsnOffset] == 101);
+
+    const auto restored = LogPayloadCodec::decodePageImageWritten(bytes);
+    assert(restored.transactionId == TransactionId{7001});
+    assert(restored.pageId == 0x01020304);
+    assert(restored.previousTxLsn == 88);
+    assert(restored.pageFormatVersion == Page::kFormatVersionV2);
+    assert(restored.beforeImage == source.beforeImage);
+    assert(restored.afterImage == source.afterImage);
+    Page restoredBefore;
+    restoredBefore.deserialize(restored.beforeImage);
+    Page restoredAfter;
+    restoredAfter.deserialize(restored.afterImage);
+    assert(restoredBefore.pageLsn() == 100);
+    assert(restoredAfter.pageLsn() == 101);
+
+    const LogRecord record{LogSequenceNumber{102}, LogRecordType::PageImageWritten, bytes};
+    const auto decodedRecord = LogRecord::deserialize(record.serialize());
+    assert(decodedRecord.lsn() == LogSequenceNumber{102});
+    assert(decodedRecord.type() == LogRecordType::PageImageWritten);
+    assert(decodedRecord.payload() == bytes);
+    assert(LogPayloadCodec::decodePageImageWritten(decodedRecord.payload()).afterImage == source.afterImage);
+
+    auto corruptedRecord = record.serialize();
+    corruptedRecord.back() ^= 0x01;
+    assertDecodeFails(corruptedRecord, [](std::span<const Byte> data) {
+      return LogRecord::deserialize(data);
+    });
+
+    auto truncated = bytes;
+    truncated.pop_back();
+    assertDecodeFails(truncated, [](std::span<const Byte> data) {
+      return LogPayloadCodec::decodePageImageWritten(data);
+    });
+
+    auto oversized = bytes;
+    oversized.push_back(0);
+    assertDecodeFails(oversized, [](std::span<const Byte> data) {
+      return LogPayloadCodec::decodePageImageWritten(data);
+    });
+
+    auto wrongPayloadVersion = bytes;
+    wrongPayloadVersion[0] = 2;
+    assertDecodeFails(wrongPayloadVersion, [](std::span<const Byte> data) {
+      return LogPayloadCodec::decodePageImageWritten(data);
+    });
+
+    auto wrongPageFormat = bytes;
+    wrongPageFormat[24] = 1;
+    assertDecodeFails(wrongPageFormat, [](std::span<const Byte> data) {
+      return LogPayloadCodec::decodePageImageWritten(data);
+    });
+
+    auto invalidBeforeImage = bytes;
+    invalidBeforeImage[28 + PageHeader::serializedSize()] ^= 0x01;
+    assertDecodeFails(invalidBeforeImage, [](std::span<const Byte> data) {
+      return LogPayloadCodec::decodePageImageWritten(data);
+    });
+
+    auto invalidAfterImage = bytes;
+    invalidAfterImage[28 + kDefaultPageSize + PageHeader::serializedSize()] ^= 0x01;
+    assertDecodeFails(invalidAfterImage, [](std::span<const Byte> data) {
+      return LogPayloadCodec::decodePageImageWritten(data);
+    });
+
+    Page mismatchedPage;
+    mismatchedPage.header().version = Page::kFormatVersionV2;
+    mismatchedPage.header().pageId = 1;
+    mismatchedPage.header().pageType = PageType::Table;
+    const auto mismatchedImage = mismatchedPage.serialize();
+    auto mismatchedPageId = bytes;
+    std::copy(mismatchedImage.begin(), mismatchedImage.end(), mismatchedPageId.begin() + 28);
+    assertDecodeFails(mismatchedPageId, [](std::span<const Byte> data) {
+      return LogPayloadCodec::decodePageImageWritten(data);
+    });
+
+    auto malformedImage = bytes;
+    malformedImage[28 + Page::kV2PageLsnOffset] ^= 0x01;
+    assertDecodeFails(malformedImage, [](std::span<const Byte> data) {
+      return LogPayloadCodec::decodePageImageWritten(data);
+    });
+
+    auto invalidTransaction = source;
+    invalidTransaction.transactionId = TransactionId{};
+    bool encodeThrew = false;
+    try {
+      (void)LogPayloadCodec::encodePageImageWritten(invalidTransaction);
+    } catch (const std::invalid_argument&) {
+      encodeThrew = true;
+    }
+    assert(encodeThrew);
   }
 
   {

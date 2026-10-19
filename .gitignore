@@ -14,6 +14,13 @@ CMakeFiles/
 Makefile
 cmake_install.cmake
 
+# Local development state and disposable verification output
+.claude/
+build/compile_audit.*
+build/dissertation_assets/
+tmp_wal_check/
+tmp_wal_lsn_review/
+
 # IDE
 .vs/
 .vscode/

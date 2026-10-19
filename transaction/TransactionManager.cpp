@@ -1,12 +1,29 @@
 #include "transaction/TransactionManager.hpp"
 
+#include "wal/LogPayload.hpp"
+
+#include <algorithm>
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 
 namespace zenthrildb {
 
 TransactionManager::TransactionManager(LogManager& logManager)
-  : logAdapter_(logManager) {}
+  : logAdapter_(logManager) {
+  for (const auto& record : logManager.replay()) {
+    if (record.type() != LogRecordType::TransactionStarted &&
+        record.type() != LogRecordType::TransactionCommitted &&
+        record.type() != LogRecordType::TransactionRolledBack) {
+      continue;
+    }
+    const auto transactionId = LogPayloadCodec::decodeTransaction(record.payload()).transactionId.value();
+    if (transactionId == std::numeric_limits<std::uint64_t>::max()) {
+      throw std::overflow_error("Transaction id space exhausted");
+    }
+    nextId_ = std::max(nextId_, transactionId + 1);
+  }
+}
 
 Transaction TransactionManager::begin() {
   std::lock_guard lock(mutex_);
@@ -26,7 +43,12 @@ Transaction TransactionManager::begin() {
 void TransactionManager::commit(TransactionId id) {
   std::lock_guard lock(mutex_);
   auto& transaction = requireActive(id);
-  (void)logAdapter_.recordCommit(id);
+  try {
+    (void)logAdapter_.recordCommit(id);
+  } catch (const CommitOutcomeUnknown&) {
+    transaction.markCommitInDoubt(currentTimeUnixNs());
+    throw;
+  }
   transaction.markCommitted(currentTimeUnixNs());
 }
 

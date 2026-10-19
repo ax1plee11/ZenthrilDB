@@ -4,6 +4,7 @@
 #include "storage/PageHeader.hpp"
 #include "transaction/TransactionId.hpp"
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -37,6 +38,15 @@ struct PageWrittenPayload {
   std::uint64_t ownerTableId{0};
 };
 
+struct PageImageWrittenPayload {
+  TransactionId transactionId{};
+  PageId pageId{0};
+  std::uint64_t previousTxLsn{0};
+  std::uint32_t pageFormatVersion{0};
+  std::array<Byte, kDefaultPageSize> beforeImage{};
+  std::array<Byte, kDefaultPageSize> afterImage{};
+};
+
 struct MetadataUpdatedPayload {
   MetadataPayloadKind kind{MetadataPayloadKind::DatabaseMetadata};
   PageId pageId{0};
@@ -51,6 +61,9 @@ struct TransactionPayload {
 class LogPayloadCodec {
 public:
   static constexpr std::uint32_t kPayloadFormatVersion = 1;
+  static constexpr std::size_t kPageImageWrittenPayloadSize =
+    sizeof(std::uint32_t) + sizeof(std::uint64_t) + sizeof(PageId) + sizeof(std::uint64_t) +
+    sizeof(std::uint32_t) + kDefaultPageSize * 2;
 
   [[nodiscard]] static std::vector<Byte> encodePageAllocation(const PageAllocationPayload& payload);
   [[nodiscard]] static PageAllocationPayload decodePageAllocation(std::span<const Byte> bytes);
@@ -60,6 +73,9 @@ public:
 
   [[nodiscard]] static std::vector<Byte> encodePageWritten(const PageWrittenPayload& payload);
   [[nodiscard]] static PageWrittenPayload decodePageWritten(std::span<const Byte> bytes);
+
+  [[nodiscard]] static std::vector<Byte> encodePageImageWritten(const PageImageWrittenPayload& payload);
+  [[nodiscard]] static PageImageWrittenPayload decodePageImageWritten(std::span<const Byte> bytes);
 
   [[nodiscard]] static std::vector<Byte> encodeMetadataUpdated(const MetadataUpdatedPayload& payload);
   [[nodiscard]] static MetadataUpdatedPayload decodeMetadataUpdated(std::span<const Byte> bytes);
