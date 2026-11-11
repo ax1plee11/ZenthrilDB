@@ -200,14 +200,16 @@ void test_recovery() {
     FileManager files;
     files.createDatabase(databasePath);
 
-    const auto before = makeRecoveryPage(kFirstUserPageId, 0x11, 10);
-    const auto after = makeRecoveryPage(kFirstUserPageId, 0x22, 20);
+    const auto before = makeRecoveryPage(kFirstUserPageId, 0x11, 0);
+    const auto after = makeRecoveryPage(kFirstUserPageId, 0x22, 2);
     files.writePage(before);
     files.writePage(after); // Simulates the data page having reached disk before a crash.
 
     const auto pageImageRecord = [](std::uint64_t lsn, TransactionId transactionId) {
-      const auto before = makeRecoveryPage(kFirstUserPageId, 0x11, 10);
-      const auto after = makeRecoveryPage(kFirstUserPageId, 0x22, 20);
+      // Page LSNs must agree with the WAL: an image from a future LSN would
+      // correctly cause the redo applier to skip this record as stale.
+      const auto before = makeRecoveryPage(kFirstUserPageId, 0x11, 0);
+      const auto after = makeRecoveryPage(kFirstUserPageId, 0x22, lsn);
       return LogRecord{LogSequenceNumber{lsn}, LogRecordType::PageImageWritten,
                        LogPayloadCodec::encodePageImageWritten(PageImageWrittenPayload{
                          .transactionId = transactionId,
@@ -234,6 +236,7 @@ void test_recovery() {
     const auto undoResult = executor.execute(undoPlan);
     assert(undoResult.undoApplied == 1);
     assert(files.readPage(kFirstUserPageId).payload()[0] == 0x11);
+    assert(files.readPage(kFirstUserPageId).pageLsn() == 0);
 
     RecoveryContext redoContext;
     redoContext.addRecord(recoveryTransactionRecord(3, LogRecordType::TransactionStarted, TransactionId{502}));
@@ -244,6 +247,11 @@ void test_recovery() {
     const auto redoResult = executor.execute(redoPlan);
     assert(redoResult.redoApplied == 1);
     assert(files.readPage(kFirstUserPageId).payload()[0] == 0x22);
+    assert(files.readPage(kFirstUserPageId).pageLsn() == 4);
+    UndoRedoRecoveryExecutor repeatedExecutor(applier, applier);
+    (void)repeatedExecutor.execute(redoPlan);
+    assert(files.readPage(kFirstUserPageId).payload()[0] == 0x22);
+    assert(files.readPage(kFirstUserPageId).pageLsn() == 4);
 
     files.closeDatabase();
     std::filesystem::remove(databasePath);

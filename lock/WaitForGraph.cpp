@@ -1,6 +1,7 @@
 #include "lock/WaitForGraph.hpp"
 
 #include <algorithm>
+#include <mutex>
 
 namespace zenthrildb {
 
