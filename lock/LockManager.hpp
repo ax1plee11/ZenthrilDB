@@ -52,7 +52,7 @@ struct WaiterEntry {
   LockMode mode{LockMode::Shared};
   std::chrono::steady_clock::time_point queuedAt{};
   bool isUpgrade{false};  // upgrading from Shared to Exclusive
-  std::condition_variable* cv{nullptr};
+  std::condition_variable_any* cv{nullptr};
   bool granted{false};
   bool timedOut{false};
   std::size_t queuePosition{0};
@@ -155,7 +155,8 @@ private:
                               LockMode mode, bool isUpgrade);
 
   // Remove a waiter from the queue (on timeout or cancellation).
-  void removeWaiter(LockResourceId resource, TransactionId transactionId);
+  void removeWaiter(LockResourceId resource, const WaiterEntry* waiter);
+  void cancelWaiters(LockResourceEntry& entry, TransactionId transactionId);
 
   LockResourceEntry& getOrCreateResourceEntry(LockResourceId resource) const;
 

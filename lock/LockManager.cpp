@@ -89,7 +89,7 @@ bool LockManager::acquire(TransactionId transactionId,
       auto victim = SelectVictim(deadlocks);
       if (victim && deadlockHandler_->OnDeadlock(*victim, deadlocks)) {
         deadlocksResolved_.fetch_add(1, std::memory_order_relaxed);
-        removeWaiter(resource, transactionId);
+        removeWaiter(resource, &waiter);
         return false;
       }
     }
@@ -119,13 +119,13 @@ bool LockManager::acquire(TransactionId transactionId,
          !waitTracker_.maxWaitNs.compare_exchange_weak(maxWait, waitDuration.count()));
 
   if (waiter.granted) {
-    removeWaiter(resource, transactionId);
+    removeWaiter(resource, &waiter);
     return true;
   }
 
   // Timed out.
   timeouts_.fetch_add(1, std::memory_order_relaxed);
-  removeWaiter(resource, transactionId);
+  removeWaiter(resource, &waiter);
   return false;
 }
 
@@ -156,7 +156,7 @@ void LockManager::release(TransactionId transactionId, LockResourceId resource) 
                 granted.end());
 
   // Remove from wait queue if present.
-  removeWaiter(resource, transactionId);
+  cancelWaiters(entry, transactionId);
 
   waitGraph_->removeEdges(transactionId);
 
@@ -172,31 +172,26 @@ void LockManager::releaseAll(TransactionId transactionId) {
   for (auto it = locks_.begin(); it != locks_.end();) {
     auto& entry = *it->second;
     auto& granted = entry.granted;
-    bool hadLock = false;
 
     granted.erase(std::remove_if(granted.begin(), granted.end(), [&](const GrantedLock& g) {
-                    bool match = (g.transactionId == transactionId);
-                    if (match) hadLock = true;
-                    return match;
+                    return g.transactionId == transactionId;
                   }),
                   granted.end());
 
     // Remove from current resource's wait queue if present.
-    entry.waiters.remove_if([&](const WaiterEntry& w) { return w.transactionId == transactionId; });
+    cancelWaiters(entry, transactionId);
 
     if (granted.empty() && entry.waiters.empty()) {
       it = locks_.erase(it);
     } else {
-      if (hadLock) {
-        wakeNextWaiters(entry);
-      }
+      wakeNextWaiters(entry);
       ++it;
     }
   }
 
   // Remove from any remaining wait queues.
   for (auto& [_, e] : locks_) {
-    e->waiters.remove_if([&](const WaiterEntry& w) { return w.transactionId == transactionId; });
+    cancelWaiters(*e, transactionId);
   }
 
   waitGraph_->removeEdges(transactionId);
@@ -241,7 +236,7 @@ bool LockManager::upgrade(TransactionId transactionId, LockResourceId resource, 
       auto victim = SelectVictim(deadlocks);
       if (victim && deadlockHandler_->OnDeadlock(*victim, deadlocks)) {
         deadlocksResolved_.fetch_add(1, std::memory_order_relaxed);
-        removeWaiter(resource, transactionId);
+        removeWaiter(resource, &waiter);
         return false;
       }
     }
@@ -263,12 +258,12 @@ bool LockManager::upgrade(TransactionId transactionId, LockResourceId resource, 
   waitTracker_.waitCount.fetch_add(1, std::memory_order_relaxed);
 
   if (waiter.granted) {
-    removeWaiter(resource, transactionId);
+    removeWaiter(resource, &waiter);
     return true;
   }
 
   timeouts_.fetch_add(1, std::memory_order_relaxed);
-  removeWaiter(resource, transactionId);
+  removeWaiter(resource, &waiter);
   return false;
 }
 
@@ -405,11 +400,12 @@ void LockManager::ClearTransactionState(TransactionId transactionId) {
                                          return g.transactionId == transactionId;
                                        }),
                         entry.granted.end());
-    entry.waiters.remove_if([&](const WaiterEntry& w) { return w.transactionId == transactionId; });
+    cancelWaiters(entry, transactionId);
 
     if (entry.granted.empty() && entry.waiters.empty()) {
       it = locks_.erase(it);
     } else {
+      wakeNextWaiters(entry);
       ++it;
     }
   }
@@ -448,6 +444,9 @@ bool LockManager::canGrant(TransactionId transactionId,
   // SECURITY: FIFO fairness — if there are waiters, only grant if this transaction
   // is next in the queue. This prevents new requests from bypassing the queue.
   if (!entry.waiters.empty()) {
+    for (const auto& waiter : entry.waiters) {
+      if (!waiter.granted && !waiter.timedOut) return false;
+    }
     // Check if this transaction is the first waiter and can be granted.
     const auto& firstWaiter = entry.waiters.front();
     if (firstWaiter.transactionId == transactionId && firstWaiter.granted) {
@@ -516,6 +515,10 @@ void LockManager::wakeNextWaiters(LockResourceEntry& entry) {
   // Walk FIFO queue and grant locks to eligible waiters.
   for (auto it = entry.waiters.begin(); it != entry.waiters.end();) {
     auto& waiter = *it;
+    if (waiter.granted || waiter.timedOut) {
+      ++it;
+      continue;
+    }
 
     // Check if this waiter can be granted given current granted locks.
     bool canGrantNow = true;
@@ -535,7 +538,9 @@ void LockManager::wakeNextWaiters(LockResourceEntry& entry) {
         }
       }
       grantFromWaiter(entry, waiter);
-      it = entry.waiters.erase(it);
+      // The blocked thread removes its own entry after waking; it still
+      // holds a reference across condition_variable_any::wait_for.
+      ++it;
     } else {
       // Writer-preference: if there's an Exclusive waiter ahead in the queue,
       // don't grant Shared locks to waiters that come after.
@@ -578,18 +583,29 @@ WaiterEntry& LockManager::enqueueWaiter(LockResourceId resource,
   return entry.waiters.back();
 }
 
-void LockManager::removeWaiter(LockResourceId resource, TransactionId transactionId) {
+void LockManager::removeWaiter(LockResourceId resource, const WaiterEntry* waiter) {
   auto it = locks_.find(resource);
   if (it == locks_.end()) {
     return;
   }
   it->second->waiters.remove_if([&](const WaiterEntry& w) {
-    return w.transactionId == transactionId;
+    return &w == waiter;
   });
 }
 
+void LockManager::cancelWaiters(LockResourceEntry& entry, TransactionId transactionId) {
+  // Cancellation must wake the owner without freeing its referenced waiter.
+  for (auto& waiter : entry.waiters) {
+    if (waiter.transactionId == transactionId) {
+      waiter.timedOut = true;
+      waiter.granted = false;
+      if (waiter.cv) waiter.cv->notify_one();
+    }
+  }
+}
+
 std::vector<TransactionId> LockManager::DetectDeadlocksInternal(TransactionId startNode) const {
-  auto adjacency = waitGraph_->buildAdjacency(*this);
+  auto adjacency = waitGraph_->buildAdjacencyLocked(*this);
   if (!adjacency.empty() && startNode.valid()) {
     return waitGraph_->findCycle(startNode, adjacency);
   }

@@ -9,6 +9,7 @@
 *.lib
 
 # CMake
+build-ci/
 CMakeCache.txt
 CMakeFiles/
 Makefile

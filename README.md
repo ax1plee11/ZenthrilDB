@@ -2,24 +2,43 @@
 
 ZenthrilDB is an original C++23 storage engine foundation designed for local-first database persistence.
 
-This repository currently contains the first MVP subsystem:
+## Status: Research component (not integrated with Go backend)
 
-- database file format
-- page format and checksum validation
-- binary file manager
+ZenthrilDB is a standalone research project. It is **not** integrated with the Zenthril Go backend, which uses PostgreSQL as its primary database. No decision has been made to adopt ZenthrilDB as a replacement for PostgreSQL.
+
+## Implemented subsystems
+
+The following C++23 subsystems are implemented:
+
+- Database file format
+- Page format and checksum validation
+- Binary file manager
 - CRC32 integrity checking
-- basic LRU buffer management
-- future security interfaces
+- Basic LRU buffer management
+- Write-Ahead Log (WAL) — `wal/`
+- Crash recovery — `wal/RecoveryContext.*`
+- Transaction management — `transaction/`
+- Lock manager with wait-for graph — `lock/`
+- Free page management — `core/FreePageManager.*`
+- Future security interfaces — `core/EncryptionInterfaces.hpp`
 
-The architecture is intentionally small and explicit so later work can extend it toward remote, cloud, and enterprise deployments.
+## Build
 
-## Project Documentation
+CMake-based build. See `CMakeLists.txt` for targets. Build artifacts (`.obj`) are present in this directory but are not part of the source tree.
 
-- `docs/architecture.md`: current architecture overview
-- `docs/ROADMAP.md`: phased development plan
-- `docs/CHANGELOG.md`: internal version history
-- `docs/WAL_SPEC.md`: write-ahead log binary specification
-- `docs/RECOVERY_SPEC.md`: recovery architecture and execution contract
-- `docs/TRANSACTION_SPEC.md`: transaction lifecycle specification
-- `docs/LOCK_SPEC.md`: local lock manager specification
-- `docs/ADR/`: architectural decision records
+## Project documentation
+
+The following design documents are planned but not yet present in this tree:
+
+- Architecture overview
+- Phased development roadmap
+- Change history
+- WAL binary specification
+- Recovery architecture and execution contract
+- Transaction lifecycle specification
+- Local lock manager specification
+- Architectural decision records (ADR)
+
+## Relationship to Zenthril
+
+ZenthrilDB is maintained in the same repository for provenance purposes but is developed independently. The Go backend (`backend/`) does not depend on ZenthrilDB and uses PostgreSQL.

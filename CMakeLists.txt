@@ -29,6 +29,7 @@ add_library(zenthrildb_core
   recovery/RecoveryExecutor.cpp
   recovery/RecoveryPlan.cpp
   lock/LockManager.cpp
+  lock/WaitForGraph.cpp
   transaction/Transaction.cpp
   transaction/TransactionLogAdapter.cpp
   transaction/TransactionManager.cpp

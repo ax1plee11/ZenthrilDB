@@ -1,0 +1,25 @@
+name: C++ build and tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Debug build
+        run: cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=Debug -DZENTHRILDB_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build-ci --config Debug --parallel 2
+      - name: Test
+        run: ctest --test-dir build-ci -C Debug --output-on-failure --timeout 60

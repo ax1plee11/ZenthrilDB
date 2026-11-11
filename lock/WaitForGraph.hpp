@@ -47,10 +47,19 @@ public:
   template <typename LockManagerType>
   [[nodiscard]] std::unordered_map<TransactionId, std::vector<TransactionId>>
   buildAdjacency(const LockManagerType& manager) const {
+    std::shared_lock lock(manager.mutex_);
+    return buildAdjacencyLocked(manager);
+  }
+
+private:
+  friend class LockManager;
+  // LockManager already holds its mutex during deadlock detection.
+  template <typename LockManagerType>
+  [[nodiscard]] std::unordered_map<TransactionId, std::vector<TransactionId>>
+  buildAdjacencyLocked(const LockManagerType& manager) const {
     std::unordered_map<TransactionId, std::vector<TransactionId>> adjacency;
 
-    // Acquire shared lock on LockManager's mutex via its friend access.
-    std::shared_lock lock(manager.mutex_);
+    // Read the manager state under the caller-owned manager lock.
     for (const auto& [resourceId, entry] : manager.locks_) {
       (void)resourceId;
       for (const auto& waiter : entry->waiters) {
@@ -64,12 +73,14 @@ public:
     return adjacency;
   }
 
+public:
   // Find a cycle starting from the given node using DFS.
   // Returns the cycle path if found, empty vector otherwise.
   [[nodiscard]] std::vector<TransactionId> findCycle(
       TransactionId startNode,
       const std::unordered_map<TransactionId, std::vector<TransactionId>>& adjacency) const;
 
+public:
   // Get current edge count for diagnostics.
   [[nodiscard]] std::size_t edgeCount() const;
 
