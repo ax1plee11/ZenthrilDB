@@ -20,4 +20,9 @@ void Transaction::markCommitInDoubt(std::uint64_t finishedAtUnixNs) noexcept {
   finishedAtUnixNs_ = finishedAtUnixNs;
 }
 
+void Transaction::markRollbackInDoubt(std::uint64_t finishedAtUnixNs) noexcept {
+  state_ = TransactionState::RollbackInDoubt;
+  finishedAtUnixNs_ = finishedAtUnixNs;
+}
+
 } // namespace zenthrildb

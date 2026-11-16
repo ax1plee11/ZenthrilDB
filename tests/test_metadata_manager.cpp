@@ -1,6 +1,11 @@
 #include "core/FileManager.hpp"
 #include "core/FreePageManager.hpp"
 #include "core/MetadataManager.hpp"
+#include "core/StorageConsistencyChecker.hpp"
+#include "tests/TestDatabaseFiles.hpp"
+#include "transaction/StorageMutationCoordinator.hpp"
+#include "transaction/TransactionManager.hpp"
+#include "wal/LogManager.hpp"
 
 #include <cassert>
 #include <filesystem>
@@ -9,16 +14,17 @@ using namespace zenthrildb;
 
 void test_metadata_manager() {
   const auto path = std::filesystem::temp_directory_path() / "zenthrildb_metadata.zdb";
-  if (std::filesystem::exists(path)) {
-    std::filesystem::remove(path);
-  }
+  removeTestDatabaseArtifacts(path);
 
   FileManager fm;
   fm.createDatabase(path);
-  FreePageManager freePages(fm);
+  LogManager metadataWal(databaseWalPath(path));
+  TransactionManager transactions(metadataWal);
+  StorageMutationCoordinator mutationCoordinator(fm, metadataWal, transactions);
+  FreePageManager freePages(fm, mutationCoordinator);
   freePages.load();
 
-  MetadataManager metadata(fm, freePages);
+  MetadataManager metadata(fm, freePages, mutationCoordinator);
   const auto table = metadata.createTable("accounts");
   assert(metadata.tableExists("accounts"));
   assert(table.name() == "accounts");
@@ -46,8 +52,11 @@ void test_metadata_manager() {
 
   FileManager reopened;
   reopened.openDatabase(path);
-  FreePageManager reopenedFreePages(reopened);
-  MetadataManager recovered(reopened, reopenedFreePages);
+  LogManager recoveredWal(databaseWalPath(path));
+  TransactionManager recoveredTransactions(recoveredWal);
+  StorageMutationCoordinator recoveredCoordinator(reopened, recoveredWal, recoveredTransactions);
+  FreePageManager reopenedFreePages(reopened, recoveredCoordinator);
+  MetadataManager recovered(reopened, reopenedFreePages, recoveredCoordinator);
   recovered.loadMetadata();
   assert(recovered.tableExists("ledger"));
   const auto recoveredTable = recovered.getTable("ledger");
@@ -55,9 +64,29 @@ void test_metadata_manager() {
   assert(recoveredTable->recordCount() == 12);
   assert(recovered.pageDirectory().get(recoveredTable->rootPageId()) != nullptr);
 
+  const auto consistency = StorageConsistencyChecker{}.check(
+    reopened, reopenedFreePages, recovered, recoveredWal);
+  assert(consistency.pagesChecked == reopened.header().totalPages);
+
   assert(recovered.deleteTable("ledger"));
   assert(!recovered.tableExists("ledger"));
+  const auto afterDeleteConsistency = StorageConsistencyChecker{}.check(
+    reopened, reopenedFreePages, recovered, recoveredWal);
+  assert(afterDeleteConsistency.transactionsChecked >= 4);
 
   reopened.closeDatabase();
-  std::filesystem::remove(path);
+  FileManager afterDelete;
+  afterDelete.openDatabase(path);
+  LogManager afterDeleteWal(databaseWalPath(path));
+  TransactionManager afterDeleteTransactions(afterDeleteWal);
+  StorageMutationCoordinator afterDeleteCoordinator(afterDelete, afterDeleteWal, afterDeleteTransactions);
+  FreePageManager afterDeleteFreePages(afterDelete, afterDeleteCoordinator);
+  afterDeleteFreePages.load();
+  MetadataManager afterDeleteMetadata(afterDelete, afterDeleteFreePages, afterDeleteCoordinator);
+  afterDeleteMetadata.loadMetadata();
+  assert(!afterDeleteMetadata.tableExists("ledger"));
+  assert(afterDeleteFreePages.freePages().contains(recoveredTable->rootPageId()));
+  (void)StorageConsistencyChecker{}.check(afterDelete, afterDeleteFreePages, afterDeleteMetadata, afterDeleteWal);
+  afterDelete.closeDatabase();
+  removeTestDatabaseArtifacts(path);
 }

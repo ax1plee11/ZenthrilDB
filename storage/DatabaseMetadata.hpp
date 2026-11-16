@@ -14,7 +14,7 @@ namespace zenthrildb {
 class DatabaseMetadata {
 public:
   static constexpr std::uint32_t kMetadataVersion = 1;
-  static constexpr std::size_t kStorageSize = kDefaultPageSize - PageHeader::serializedSize();
+  static constexpr std::size_t kStorageSize = kDefaultPageSize - PageHeader::serializedSize() - sizeof(std::uint64_t);
 
   [[nodiscard]] const std::vector<TableMetadata>& tables() const noexcept { return tables_; }
   [[nodiscard]] bool tableExists(const std::string& name) const;

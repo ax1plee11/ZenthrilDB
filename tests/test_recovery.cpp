@@ -6,6 +6,7 @@
 #include "storage/Page.hpp"
 #include "wal/LogPayload.hpp"
 #include "wal/LogManager.hpp"
+#include "tests/TestDatabaseFiles.hpp"
 
 #include <cassert>
 #include <filesystem>
@@ -64,13 +65,14 @@ void test_recovery() {
     auto context = log.prepareRecovery();
     const auto plan = engine.analyze(context);
     assert(plan.checkpointLsn() == LogSequenceNumber{3});
-    assert(plan.actions().size() == 3);
-    assert(plan.actions()[0].actionType == RecoveryActionType::CheckpointBoundary);
-    assert(plan.actions()[1].actionType == RecoveryActionType::MetadataRefresh);
-    assert(plan.actions()[2].actionType == RecoveryActionType::RecoveryMarker);
+    assert(plan.actions().size() == 5);
+    assert(plan.actions()[1].actionType == RecoveryActionType::RedoCandidate);
+    assert(plan.actions()[2].actionType == RecoveryActionType::CheckpointBoundary);
+    assert(plan.actions()[3].actionType == RecoveryActionType::MetadataRefresh);
+    assert(plan.actions()[4].actionType == RecoveryActionType::RecoveryMarker);
 
     engine.recover(context);
-    assert(engine.lastPlan().actions().size() == 3);
+    assert(engine.lastPlan().actions().size() == 5);
   }
 
   std::filesystem::remove(path);
@@ -93,6 +95,27 @@ void test_recovery() {
     assert(plan.transactionStatuses().at(TransactionId{41}) == TransactionRecoveryStatus::Committed);
     assert(plan.transactionStatuses().at(TransactionId{42}) == TransactionRecoveryStatus::RolledBack);
     assert(plan.transactionStatuses().at(TransactionId{43}) == TransactionRecoveryStatus::Incomplete);
+
+    RecoveryContext rolledBackPages;
+    rolledBackPages.addRecord(transactionRecord(1, LogRecordType::TransactionStarted, 44));
+    const auto before = makeRecoveryPage(kFirstUserPageId, 0x11, 0);
+    const auto after = makeRecoveryPage(kFirstUserPageId, 0x22, 2);
+    rolledBackPages.addRecord(LogRecord{LogSequenceNumber{2}, LogRecordType::PageImageWritten,
+      LogPayloadCodec::encodePageImageWritten(PageImageWrittenPayload{
+        .transactionId = TransactionId{44}, .pageId = kFirstUserPageId,
+        .pageFormatVersion = Page::kFormatVersionV2,
+        .beforeImage = before.serialize(), .afterImage = after.serialize(),
+      })});
+    rolledBackPages.addRecord(transactionRecord(3, LogRecordType::TransactionRolledBack, 44));
+    const auto rolledBackPlan = engine.analyze(rolledBackPages);
+    assert(rolledBackPlan.actions()[1].actionType == RecoveryActionType::UndoCandidate);
+
+    RecoveryContext invalidLifecycle;
+    invalidLifecycle.addRecord(transactionRecord(1, LogRecordType::TransactionCommitted, 45));
+    bool invalidRejected = false;
+    try { (void)engine.analyze(invalidLifecycle); }
+    catch (const std::runtime_error&) { invalidRejected = true; }
+    assert(invalidRejected);
   }
 
   {
@@ -254,6 +277,6 @@ void test_recovery() {
     assert(files.readPage(kFirstUserPageId).pageLsn() == 4);
 
     files.closeDatabase();
-    std::filesystem::remove(databasePath);
+    removeTestDatabaseArtifacts(databasePath);
   }
 }

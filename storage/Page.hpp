@@ -5,8 +5,14 @@
 #include <array>
 #include <cstddef>
 #include <span>
+#include <stdexcept>
 
 namespace zenthrildb {
+
+class PageChecksumError final : public std::invalid_argument {
+public:
+  PageChecksumError() : std::invalid_argument("Page checksum verification failed") {}
+};
 
 class Page {
 public:

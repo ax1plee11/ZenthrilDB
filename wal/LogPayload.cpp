@@ -2,10 +2,41 @@
 
 #include "storage/Page.hpp"
 #include "storage/BinaryIO.hpp"
+#include "core/CRCManager.hpp"
 
+#include <limits>
 #include <stdexcept>
 
 namespace zenthrildb {
+
+std::vector<Byte> LogPayloadCodec::encodeSafeCheckpoint(const SafeCheckpointPayload& payload) {
+  std::vector<Byte> bytes(kSafeCheckpointPayloadSize);
+  std::size_t offset = 0;
+  binary::writeLittleEndian<std::uint32_t>(bytes, offset, kPayloadFormatVersion);
+  binary::writeBytes(bytes, offset, payload.databaseUuid);
+  binary::writeBytes(bytes, offset, payload.generation);
+  binary::writeLittleEndian(bytes, offset, payload.durableWalLsn);
+  binary::writeLittleEndian(bytes, offset, payload.transactionHighWater);
+  return bytes;
+}
+
+SafeCheckpointPayload LogPayloadCodec::decodeSafeCheckpoint(std::span<const Byte> bytes) {
+  if (bytes.size() != kSafeCheckpointPayloadSize) throw std::invalid_argument("Invalid safe checkpoint payload size");
+  std::size_t offset = 0;
+  if (binary::readLittleEndian<std::uint32_t>(bytes, offset) != kPayloadFormatVersion) {
+    throw std::invalid_argument("Unsupported safe checkpoint payload version");
+  }
+  SafeCheckpointPayload payload;
+  binary::readBytes(bytes, offset, payload.databaseUuid);
+  binary::readBytes(bytes, offset, payload.generation);
+  payload.durableWalLsn = binary::readLittleEndian<std::uint64_t>(bytes, offset);
+  payload.transactionHighWater = binary::readLittleEndian<std::uint64_t>(bytes, offset);
+  if (std::ranges::all_of(payload.generation, [](Byte b) { return b == 0; }) ||
+      std::ranges::all_of(payload.databaseUuid, [](Byte b) { return b == 0; })) {
+    throw std::invalid_argument("Invalid safe checkpoint identity");
+  }
+  return payload;
+}
 
 namespace {
 
@@ -40,6 +71,22 @@ void validatePageImage(const std::array<Byte, kDefaultPageSize>& image, PageId p
   }
 }
 
+void validateHeaderImage(const std::array<Byte, DatabaseHeader::serializedSize()>& image) {
+  DatabaseHeader header;
+  header.deserialize(image);
+  if (header.magic != kDatabaseMagic || header.version != kCurrentDatabaseVersion ||
+      header.pageSize != kDefaultPageSize || header.totalPages < kFirstUserPageId ||
+      header.totalPages > static_cast<std::uint64_t>(std::numeric_limits<PageId>::max()) + 1) {
+    throw std::invalid_argument("WAL contains an invalid database header image");
+  }
+  const auto checksum = header.checksum;
+  header.checksum = 0;
+  const auto bytes = header.serialize();
+  if (CRCManager::compute(bytes) != checksum) {
+    throw std::invalid_argument("WAL database header image checksum is invalid");
+  }
+}
+
 PageType decodePageType(std::uint32_t value) {
   switch (static_cast<PageType>(value)) {
     case PageType::Metadata:
@@ -47,6 +94,7 @@ PageType decodePageType(std::uint32_t value) {
     case PageType::Index:
     case PageType::Free:
     case PageType::Overflow:
+    case PageType::Reserved:
       return static_cast<PageType>(value);
     default:
       throw std::invalid_argument("WAL payload contains an unknown page type");
@@ -185,6 +233,44 @@ PageImageWrittenPayload LogPayloadCodec::decodePageImageWritten(std::span<const 
   ensureFullyRead(bytes, offset);
   validatePageImage(payload.beforeImage, payload.pageId);
   validatePageImage(payload.afterImage, payload.pageId);
+  return payload;
+}
+
+std::vector<Byte> LogPayloadCodec::encodeDatabaseHeaderImageWritten(
+    const DatabaseHeaderImageWrittenPayload& payload) {
+  if (!payload.transactionId.valid()) {
+    throw std::invalid_argument("Database header WAL payload contains an invalid transaction id");
+  }
+  validateHeaderImage(payload.beforeImage);
+  validateHeaderImage(payload.afterImage);
+  std::vector<Byte> bytes;
+  bytes.reserve(kDatabaseHeaderImagePayloadSize);
+  appendVersion(bytes);
+  binary::appendLittleEndian<std::uint64_t>(bytes, payload.transactionId.value());
+  binary::appendLittleEndian<std::uint64_t>(bytes, payload.previousTxLsn);
+  bytes.insert(bytes.end(), payload.beforeImage.begin(), payload.beforeImage.end());
+  bytes.insert(bytes.end(), payload.afterImage.begin(), payload.afterImage.end());
+  return bytes;
+}
+
+DatabaseHeaderImageWrittenPayload LogPayloadCodec::decodeDatabaseHeaderImageWritten(
+    std::span<const Byte> bytes) {
+  if (bytes.size() != kDatabaseHeaderImagePayloadSize) {
+    throw std::invalid_argument("Invalid database header image WAL payload size");
+  }
+  std::size_t offset = 0;
+  validateVersion(bytes, offset);
+  DatabaseHeaderImageWrittenPayload payload;
+  payload.transactionId = TransactionId{binary::readLittleEndian<std::uint64_t>(bytes, offset)};
+  if (!payload.transactionId.valid()) {
+    throw std::invalid_argument("Database header WAL payload contains an invalid transaction id");
+  }
+  payload.previousTxLsn = binary::readLittleEndian<std::uint64_t>(bytes, offset);
+  binary::readBytes(bytes, offset, payload.beforeImage);
+  binary::readBytes(bytes, offset, payload.afterImage);
+  ensureFullyRead(bytes, offset);
+  validateHeaderImage(payload.beforeImage);
+  validateHeaderImage(payload.afterImage);
   return payload;
 }
 

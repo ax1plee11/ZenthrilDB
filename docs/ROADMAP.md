@@ -1,81 +1,42 @@
-# ZenthrilDB Roadmap
+# Дорожная карта ZenthrilDB
 
-## Purpose
+Развитие исходного C++23 storage engine малыми проверяемыми этапами. Совместимость `.zdb`/`.wal` сохраняется либо описывается отдельной миграцией. Наличие интерфейса или класса не означает production-гарантию.
 
-This roadmap defines the planned evolution of ZenthrilDB from a local storage
-engine foundation into a complete database management system. It is intentionally
-incremental: each phase must compile, pass tests, and preserve compatibility with
-existing `.zdb` and `.wal` formats unless a migration strategy is explicitly
-documented.
+[Архитектура ZenthrilDB v1.0 и Fortress‑20](architecture/DATABASE_ARCHITECTURE.md) сохраняет порядок ядра и задаёт параллельные меры безопасного хранения. [Карта этапов и приёмки](roadmap/FORTRESS_ROADMAP.md).
 
-## Development Principles
+| Версия | Статус | Цель |
+|---|---|---|
+| v0.1 Storage | Complete | Файловый/страничный формат, CRC, FileManager, BufferManager |
+| v0.2 Metadata | Complete | Метаданные и резервированные страницы |
+| v0.3 Page lifecycle | Complete | Page/FreePage managers |
+| v0.4 WAL foundation | Complete | Framing, LSN, CRC |
+| v0.5 Recovery analysis | Complete | RecoveryContext/Engine/Plan, checkpoint boundary |
+| v0.6 Transaction lifecycle | Foundation | Begin/commit/rollback в WAL; не ACID |
+| v0.7 Recovery execution | Foundation | Executor, LSN idempotency, page-image applier |
+| v0.8 Typed WAL | Complete | Версионированные payload |
+| v0.9 Lock Manager | Foundation | Локальные блокировки и очередь ожидания |
+| v0.10 Reliability validation | Partial; release gate remains open | Windows/Ubuntu Debug and Release pass; WAL/page sync, automatic locked startup recovery, persistent PageDirectory coordination through PageManager, DatabaseRuntime ownership, fault injection and selected crash/recovery tests exist. Real ENOSPC/media failure, hardware power loss and broader crash-point coverage remain |
+| v0.11 IPC storage prototype | Authorized, gated | Начинать после закрытия reliability gaps; отдельный процесс и IPC v1 с изолированными тестовыми записями |
+| v0.12 MVCC foundation | Planned | Видимость версий и snapshot model |
+| v0.13 B+Tree foundation | Planned | Страничный индекс |
+| v0.14 Catalog and Record Manager | Partial | Версионированные записи, атомарный CRUD и многостраничный каталог страниц. Открыты масштабирование каталога таблиц и free-list, многостраничные значения |
+| v0.15 Query Engine MVP | Planned | Логические операции над записями |
+| v0.16 SQL Parser MVP | Planned | Ограниченный DDL/DML |
+| v0.17 Optimizer foundation | Planned | Простая rule-based оптимизация |
+| v1.0 Local DB MVP | Planned | Проверенная сохранность, транзакции, записи и базовый SQL |
+| Zenthril shadow trial | Planned, gated | Только некритичные журналы; PostgreSQL authoritative; сверка и rollback |
 
-- Keep the architecture original and independent from existing database engines.
-- Prefer small, verifiable subsystems over large rewrites.
-- Preserve binary compatibility by using explicit versioned formats.
-- Treat durability, corruption detection, and concurrency safety as default requirements.
-- Do not introduce SQL, indexes, networking, or distributed systems before the lower layers are stable.
+## Утверждённая граница интеграции
 
-## Version Plan
+Zenthril и ZenthrilDB — самостоятельные проекты. Канал — отдельный процесс через IPC. PostgreSQL остаётся источником истины, Redis не заменяется. Начальная область — некритичные журналы событий/модерации. Аккаунты, пользовательские сообщения и криптографические ключи не переносятся; E2EE не меняется. Ошибка ZenthrilDB не должна срывать PostgreSQL-запись или основной запрос.
 
-| Version | Area | Status | Goal |
-|---|---|---:|---|
-| `v0.1` | Storage Foundation | Complete | `.zdb` file format, page format, CRC, FileManager, BufferManager |
-| `v0.2` | Metadata Foundation | Complete | durable table metadata and reserved metadata pages |
-| `v0.3` | Page Lifecycle | Complete | PageManager, FreePageManager, PageDirectory |
-| `v0.4` | WAL Foundation | Complete | independent `.wal` file, LSN, WAL record framing, CRC |
-| `v0.5` | Recovery Foundation | Complete | RecoveryContext, RecoveryEngine, RecoveryPlan, checkpoint analysis |
-| `v0.6` | Transaction Foundation | Complete | transaction lifecycle, transaction WAL boundaries |
-| `v0.7` | Undo/Redo Foundation | Complete | recovery execution scaffold, redo/undo interfaces, idempotency by LSN |
-| `v0.8` | Typed WAL Payload | Complete | versioned payload contracts for page, metadata, and transaction records |
-| `v0.9` | Lock Manager | Complete | local lock manager for table/page level coordination |
-| `v0.10` | MVCC Foundation | Planned | row/version visibility model and transaction snapshots |
-| `v0.11` | B+Tree Foundation | Planned | primary index structure and page split/merge mechanics |
-| `v0.12` | Catalog | Planned | system catalog for schemas, tables, indexes, and internal objects |
-| `v0.13` | Record Manager | Planned | row layout, record insertion, update, delete, and overflow support |
-| `v0.14` | Query Engine MVP | Planned | logical execution primitives without SQL optimization |
-| `v0.15` | SQL Parser MVP | Planned | limited DDL/DML syntax and AST generation |
-| `v0.16` | Optimizer Foundation | Planned | rule-based planning and cost model scaffolding |
-| `v1.0` | Local DB MVP | Planned | stable local database with storage, transactions, recovery, and basic SQL |
+## Порядок
 
-## Near-Term Priorities
+1. Актуализировать спецификации и матрицу гарантий.
+2. Проверить durability, crash/reopen и corruption границы.
+3. Создать изолированный IPC процесс для синтетических тестовых записей.
+4. Подтвердить чтение после остановки и повторного запуска.
+5. Только затем добавить Go shadow adapter для некритичных журналов; PostgreSQL остаётся authoritative.
+6. Сверить записи и отказоустойчивость, задокументировать результат.
 
-1. Lock Manager
-
-   Introduce lock modes, lock table, wait policy, and deadlock-prevention
-   scaffolding. Keep scope local only.
-
-2. MVCC Foundation
-
-   Define transaction visibility rules and version metadata. Do not implement
-   complex garbage collection until the record layer exists.
-
-3. B+Tree Foundation
-
-   Implement a page-based tree compatible with the existing PageManager and WAL
-   payload conventions.
-
-4. Catalog
-
-   Move table definitions and future index definitions into an internal catalog
-   model built on top of metadata pages.
-
-## Release Rules
-
-- Every version must include unit tests.
-- Every binary format change must update the relevant specification.
-- Every architectural decision that affects compatibility should be captured in `docs/ADR/`.
-- No planned subsystem should silently bypass WAL, CRC, or recovery interfaces.
-- Test failures block promotion to the next version.
-
-## Out of Scope Until After `v1.0`
-
-- remote mode
-- cloud mode
-- distributed replication
-- enterprise authentication and authorization
-- SQL optimizer sophistication beyond basic rule-based planning
-- encryption implementation
-
-Interfaces for these areas may exist, but full behavior should wait until the
-local engine is stable.
+Каждый переход требует зелёной сборки и тестов предыдущего этапа. IPC не реализует SQL и не заменяет PostgreSQL/Redis.

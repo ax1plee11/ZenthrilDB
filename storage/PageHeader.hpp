@@ -15,6 +15,7 @@ enum class PageType : std::uint32_t {
   Index = 3,
   Free = 4,
   Overflow = 5,
+  Reserved = 6,
 };
 
 struct PageHeader {

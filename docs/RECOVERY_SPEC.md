@@ -1,152 +1,37 @@
 # ZenthrilDB Recovery Specification
 
-## Scope
+## Current scope
 
-This document defines the current recovery architecture for ZenthrilDB. The
-implemented recovery system is a foundation for future crash recovery. It
-analyzes WAL records, creates a recovery plan, and provides an idempotent
-execution scaffold.
+`RecoveryEngine` analyses the WAL into a `RecoveryPlan`. For bound databases, `RecoveryCoordinator` derives and validates the final file size and page images before applying changes. For legacy databases, `PageImageRecoveryApplier` uses the existing ordered REDO and UNDO path. A committed transaction contributes after-images. An incomplete transaction contributes eligible before-images. [Physical recovery and its limits](PHYSICAL_RECOVERY_RU.md)
 
-The current implementation replays full page images for committed and
-incomplete transactions. MVCC visibility restoration is not implemented.
+`FileManager::openDatabase()` holds an exclusive process lock, validates the database header, opens the canonical sibling WAL (`database.zdb` -> `database.wal`), and runs `RecoveryCoordinator` before returning. Missing WAL or any validation/recovery error closes the database and fails the open. A lock sidecar (`database.zdb.lock`) is kept for the lifetime of the open `FileManager`; the lock file is deliberately not unlinked.
 
-## Recovery Pipeline
+An empty WAL is accepted when persisted V2 page LSNs do not claim a record beyond LSN 0. A missing WAL is rejected. This preserves databases whose current page writes are not coupled to WAL, but does not detect loss of an empty WAL for pages written with LSN 0. Every caller using the same database must use the documented canonical WAL path; standalone WAL users may still pass arbitrary paths to `LogManager`.
+
+Tests include separate processes forcibly terminated after durable page writes (both before COMMIT and after COMMIT), followed by recovery in a new process context and a second recovery pass. This verifies those selected process-crash barriers, not interruption inside OS write/sync calls or power-loss behavior.
+
+## Pipeline
 
 ```text
-WAL
-  -> RecoveryContext
-  -> RecoveryEngine
-  -> RecoveryPlan
-  -> UndoRedoRecoveryExecutor
-  -> RedoApplier / UndoApplier
+WAL records -> RecoveryContext -> RecoveryEngine -> RecoveryPlan
+             -> Bound recovery preflight -> FileManager
+             -> Legacy UndoRedoRecoveryExecutor -> PageImageRecoveryApplier -> FileManager
 ```
 
-## Components
+## Guarantees and limitations
 
-### RecoveryContext
+- WAL records and typed page image payloads are versioned and CRC protected.
+- Page-image replay is idempotent against the page LSN for the tested cases.
+- Durable lifecycle records use append plus `fsync`/`FlushFileBuffers`; page flush also requests OS sync. There is no general transactional page writer enforcing WAL-before-data for all mutations.
+- Runtime allocation, free-list and metadata changes are covered by physical images written by StorageMutationCoordinator. Legacy logical allocation and page records are not sufficient to reconstruct a page.
+- Transaction lifecycle order is validated; invalid start/finalize/page-image order fails closed. Boundaries do not provide complete ACID atomicity, isolation, MVCC, or rollback of arbitrary page mutations.
+- Startup invokes the coordinator automatically. Recovery supports page images and header images.
+- `StorageMutationCoordinator` uses the existing `LogManager` and `TransactionManager`. MetadataManager create/delete/save, and FreePageManager/PageManager allocation/write/free paths use page images, header images, WAL-before-data, durable commit, and fail the FileManager handle on mutation errors.
+- The coordinator must be shared by managers for the same database. Direct `FileManager::writePage()` remains an unlogged low-level API and is not covered by transactional guarantees.
+- `createDatabase()` refuses an existing database or pre-existing canonical WAL. It initializes the canonical WAL without truncating an existing database.
+- Complete CRC failures fail closed; a short final WAL frame is truncated to the last valid frame. This is not general corruption repair.
+- No claim of recovery after power loss, controller failure or media corruption is made.
 
-`RecoveryContext` stores validated `LogRecord` instances prepared by a
-`RecoveryManager`.
+## Next recovery work
 
-Responsibilities:
-
-- hold replayed WAL records
-- provide immutable access to recovery analysis
-- keep recovery input separate from WAL file IO
-
-### RecoveryEngine
-
-`RecoveryEngine` analyzes `RecoveryContext`.
-
-Responsibilities:
-
-- locate the latest checkpoint
-- ignore records before the checkpoint
-- classify records into recovery actions
-- produce a `RecoveryPlan`
-
-### RecoveryPlan
-
-`RecoveryPlan` is a deterministic list of `RecoveryAction` entries.
-
-Each action contains:
-
-- `LSN`
-- `LogRecordType`
-- `RecoveryActionType`
-
-The plan is intentionally separated from execution. This allows future tooling to
-inspect, test, simulate, or audit recovery before applying changes.
-
-### UndoRedoRecoveryExecutor
-
-`UndoRedoRecoveryExecutor` consumes a `RecoveryPlan` and delegates actual work to
-`RedoApplier` and `UndoApplier`.
-
-Current guarantees:
-
-- mutex-protected execution
-- idempotency by LSN
-- safe skipping of non-executable recovery actions
-- explicit execution result counters
-- committed `PageImageWritten` records restore their after-image
-- incomplete `PageImageWritten` records restore their before-image in reverse order
-
-## Recovery Action Types
-
-| Action Type | Meaning |
-|---|---|
-| `RedoCandidate` | should be passed to redo logic |
-| `UndoCandidate` | should be passed to undo logic |
-| `MetadataRefresh` | should be passed to redo-style metadata refresh logic |
-| `CheckpointBoundary` | recovery boundary, not directly applied |
-| `RecoveryMarker` | diagnostic marker, not directly applied |
-| `TransactionBoundary` | transaction state boundary, not directly applied yet |
-| `Ignore` | ignored by recovery execution |
-
-## Current Classification Rules
-
-| WAL Record Type | Recovery Action |
-|---|---|
-| `PageAllocated` | `RedoCandidate` |
-| `PageFreed` | `RedoCandidate` |
-| `PageWritten` | `RedoCandidate` |
-| `PageImageWritten` | redo if committed; undo if incomplete; ignore if rolled back |
-| `MetadataUpdated` | `MetadataRefresh` |
-| `Checkpoint` | `CheckpointBoundary` |
-| `RecoveryMarker` | `RecoveryMarker` |
-| `TransactionStarted` | `TransactionBoundary` |
-| `TransactionCommitted` | `TransactionBoundary` |
-| `TransactionRolledBack` | `TransactionBoundary` |
-| `DatabaseCreated` | `Ignore` |
-| `DatabaseOpened` | `Ignore` |
-| `Unknown` | `Ignore` |
-
-## Idempotency
-
-The executor records applied LSN values in memory. If a plan is executed more
-than once through the same executor, already-applied LSNs are skipped.
-
-This protects against:
-
-- retry loops
-- accidental duplicate recovery execution
-- concurrent execution attempts
-- race-condition windows that could otherwise double-apply page changes
-
-The idempotency state can be cleared with `resetIdempotencyState()` for test and
-controlled lifecycle scenarios.
-
-## Failure Handling
-
-The current recovery foundation fails closed:
-
-- invalid WAL CRC causes replay failure
-- unsupported WAL versions cause replay failure
-- unsupported payload versions cause payload decoding failure
-- malformed payloads must not be silently interpreted
-
-Future recovery executors should preserve the same behavior.
-
-## Future Crash Recovery Strategy
-
-The future crash recovery algorithm should:
-
-1. Replay and validate WAL frames.
-2. Build a transaction table from transaction boundary records.
-3. Identify committed and uncommitted transaction effects.
-4. Redo committed page and metadata operations.
-5. Undo uncommitted operations when undo payloads exist.
-6. Write a recovery marker after successful recovery.
-7. Create or advance a checkpoint once the storage state is durable.
-
-## Current Limitations
-
-- Allocation, free and metadata WAL records do not yet contain physical images.
-- No MVCC cleanup or version pruning.
-- No dirty page table.
-- No durable recovery marker policy.
-- No crash simulation harness.
-
-These limitations are intentional. The current phase provides safe interfaces and
-execution structure before adding complex recovery semantics.
+Stage 4 adds a durable checkpoint boundary while retaining the full WAL. Recovery validates that boundary and continues to use older images. The next design step is verification of a baseline that could safely replace historical images. [Safe checkpoint](SAFE_CHECKPOINT_RU.md), [recovery roadmap](roadmap/STORAGE_RECOVERY_NEXT_RU.md)

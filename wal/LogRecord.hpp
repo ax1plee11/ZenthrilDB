@@ -24,6 +24,8 @@ enum class LogRecordType : std::uint32_t {
   TransactionCommitted = 10,
   TransactionRolledBack = 11,
   PageImageWritten = 12,
+  DatabaseHeaderImageWritten = 13,
+  SafeCheckpoint = 14,
 };
 
 class LogRecord {

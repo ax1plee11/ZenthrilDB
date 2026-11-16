@@ -1,4 +1,5 @@
 #include "core/FileManager.hpp"
+#include "storage/DatabaseWalPath.hpp"
 
 #include <cassert>
 #include <filesystem>
@@ -10,6 +11,10 @@ void test_file_manager() {
   if (std::filesystem::exists(path)) {
     std::filesystem::remove(path);
   }
+  std::filesystem::remove(databaseWalPath(path));
+  auto initialLockPath = path;
+  initialLockPath += ".lock";
+  std::filesystem::remove(initialLockPath);
 
   FileManager fm;
   fm.createDatabase(path);
@@ -22,16 +27,28 @@ void test_file_manager() {
   v2Page.header().usedBytes = 2;
   v2Page.payload()[0] = 0xA1;
   v2Page.payload()[1] = 0xB2;
-  v2Page.setPageLsn(0x1020304050607080ull);
+  v2Page.setPageLsn(0);
   fm.writePage(v2Page);
   fm.flush();
   const auto restored = fm.readPage(kFirstUserPageId);
   assert(restored.header().version == Page::kFormatVersionV2);
-  assert(restored.pageLsn() == 0x1020304050607080ull);
+  assert(restored.pageLsn() == 0);
   assert(restored.payload()[0] == 0xA1);
   assert(restored.payload()[1] == 0xB2);
 
+  FileManager competing;
+  bool concurrentOpenRejected = false;
+  try { competing.openDatabase(path); }
+  catch (const std::runtime_error&) { concurrentOpenRejected = true; }
+  assert(concurrentOpenRejected);
+
   fm.closeDatabase();
   assert(!fm.isOpen());
+  competing.openDatabase(path);
+  competing.closeDatabase();
   std::filesystem::remove(path);
+  std::filesystem::remove(databaseWalPath(path));
+  auto lockPath = path;
+  lockPath += ".lock";
+  std::filesystem::remove(lockPath);
 }

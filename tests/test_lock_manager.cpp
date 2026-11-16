@@ -111,6 +111,30 @@ void test_lock_manager() {
     assert(locks.activeLockCount(resource) == 16);
   }
 
+
+  {
+    LockManager locks;
+    const auto left = LockResourceId::page(301);
+    const auto right = LockResourceId::page(302);
+    assert(locks.tryAcquire(TransactionId{31}, left, LockMode::Exclusive));
+    assert(locks.tryAcquire(TransactionId{32}, right, LockMode::Exclusive));
+    bool firstWaiterAcquired = false;
+    std::thread first([&] {
+      firstWaiterAcquired = locks.acquire(TransactionId{31}, right, LockMode::Exclusive, 2s);
+    });
+    waitForWaiter(locks, right);
+    const bool secondAcquired = locks.acquire(TransactionId{32}, left, LockMode::Exclusive, 40ms);
+    assert(!secondAcquired);
+    assert(locks.GetWaitStats().deadlocksDetected >= 1);
+    locks.releaseAll(TransactionId{32});
+    first.join();
+    assert(firstWaiterAcquired);
+    locks.releaseAll(TransactionId{31});
+    assert(locks.activeLockCount() == 0);
+    assert(locks.GetWaitQueueLength(left) == 0);
+    assert(locks.GetWaitQueueLength(right) == 0);
+  }
+
   {
     LockManager locks;
     const auto resource = LockResourceId::page(7);

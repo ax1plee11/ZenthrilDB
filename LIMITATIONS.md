@@ -1,10 +1,24 @@
-# Limitations
+# Ограничения ZenthrilDB — после этапа надёжности
 
-- Zenthril source, E2EE, network components and integration are unavailable.
-- No SQL, query engine, record manager, B+Tree, MVCC or isolation levels exist.
-- WAL does not contain physical page images/deltas; crash recovery is a foundation only.
-- `std::fstream::flush()` is used; an fsync/FlushFileBuffers durability policy is not implemented.
-- Encryption interfaces have no provider, cipher, key storage or threat-model implementation.
-- No reproducible latency, throughput, CPU, RAM, benchmark or sanitizer result exists.
-- Dedicated tests for wait-for graph cycles, starvation, upgrade/downgrade and fairness are absent.
-- The project is not a production DBMS.
+## Подтверждено тестами
+
+- WAL durable append вызывает `FlushFileBuffers`/`fsync`; успешно завершённые BEGIN/COMMIT/ROLLBACK/checkpoint используют этот путь.
+- Ошибка sync/I/O возвращается; после ошибки записи LogManager закрывает текущий writer для новых append до reopen.
+- Неполная последняя WAL-запись удаляется до последнего полного frame; CRC/форматные ошибки fail closed.
+- FileManager flush синхронизирует файл через ОС. RecoveryCoordinator выполняет ограниченный page-image REDO/UNDO и синхронизирует восстановление.
+- Процессные тесты подтверждают выбранные точки: после синхронизированной страницы до commit, после синхронизированного commit, ошибки записи metadata на критических шагах и принудительное завершение в startup recovery; затем проверяются recovery и повторный recovery.
+- Текущие Debug/Release сборки и CTest проходят на Windows x64 и Ubuntu 24.04.
+
+## Не подтверждено / не реализовано
+
+- Устойчивость к отключению питания, лживому write cache, отказу носителя/контроллера.
+- Принудительное завершение ровно внутри системного write/fsync, WAL sync, COMMIT, checkpoint, REDO и UNDO; реальное ENOSPC. Fault injection покрывает часть управляемых точек, но не физический отказ.
+- `DatabaseRuntime` создаёт единый менеджерский граф и автоматически проверяет каталог при старте. Низкоуровневые manager constructors остаются публичными для тестов и внутренних инструментов; прикладной путь должен использовать runtime.
+- `StorageMutationCoordinator` гарантирует WAL-before-data и атомарное восстановление для подключённых mutation paths, но произвольные изменения через низкоуровневый `FileManager` за это не отвечают.
+- Fault injection проверяет управляемые исключения; ENOSPC не моделируется реальным заполнением диска. Startup recovery принудительно прерывается отдельным process test, но набор точек/инвариантов ограничен.
+- Интеграция LockManager с TransactionManager и транзакционная изоляция. Межпроцессный database lock добавлен отдельно.
+- В предварительной версии доступен KV API и CLI. Одна запись занимает одну страницу. Каталог страниц расширяется блоками по 92 записи. Free-list остаётся одностраничным и вмещает 2 039 свободных страниц. Удаление, которое превысило бы этот предел, отклоняется до записи.
+- Старые базы открываются с исходным каталогом. После первого расширения каталог получает формат v2. Для возврата к предыдущей версии бинарника нужна копия базы и WAL, сделанная до расширения.
+- B+Tree, MVCC, SQL, шифрование на диске и IPC остаются за пределами текущей версии.
+
+До закрытия этих пунктов нельзя подключать ZenthrilDB к журналам приложения или объявлять её production storage. Оценка IPC-прототипа — отложена.

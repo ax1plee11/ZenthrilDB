@@ -80,7 +80,7 @@ std::array<Byte, DatabaseMetadata::kStorageSize> DatabaseMetadata::serialize() c
 }
 
 void DatabaseMetadata::deserialize(std::span<const Byte> bytes) {
-  if (bytes.size() != kStorageSize) {
+  if (bytes.size() < kStorageSize || bytes.size() > kStorageSize + sizeof(std::uint64_t)) {
     throw std::invalid_argument("Invalid database metadata page size");
   }
   std::size_t offset = 0;

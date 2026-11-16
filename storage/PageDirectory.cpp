@@ -89,7 +89,8 @@ std::array<Byte, kDefaultPageSize - PageHeader::serializedSize()> PageDirectory:
 }
 
 void PageDirectory::deserialize(std::span<const Byte> bytes) {
-  if (bytes.size() != kDefaultPageSize - PageHeader::serializedSize()) {
+  const auto legacySize = kDefaultPageSize - PageHeader::serializedSize();
+  if (bytes.size() != legacySize && bytes.size() != legacySize - sizeof(std::uint64_t)) {
     throw std::invalid_argument("Invalid page directory payload size");
   }
   std::size_t offset = 0;
@@ -115,6 +116,48 @@ void PageDirectory::deserialize(std::span<const Byte> bytes) {
     }
     entries_.emplace(entry.pageId, std::move(entry));
   }
+}
+
+Page PageDirectory::serializeChunk(PageId id, PageId next, std::span<const PageDirectoryEntry> entries) {
+  if (entries.size() > kChunkCapacity) {
+    throw std::length_error("Page directory chunk exceeds payload capacity");
+  }
+  Page page;
+  page.header().pageId = id;
+  page.header().pageType = PageType::Metadata;
+  page.header().version = Page::kFormatVersionV2;
+  auto payload = page.payload();
+  std::size_t offset = 0;
+  binary::writeLittleEndian<std::uint32_t>(payload, offset, kChainedVersion);
+  binary::writeLittleEndian<std::uint32_t>(payload, offset, static_cast<std::uint32_t>(entries.size()));
+  binary::writeLittleEndian<PageId>(payload, offset, next);
+  for (const auto& entry : entries) {
+    binary::writeBytes(payload, offset, entry.serialize());
+  }
+  page.header().usedBytes = static_cast<std::uint32_t>(offset);
+  return page;
+}
+
+PageId PageDirectory::deserializeChunk(const Page& page) {
+  const auto payload = page.payload();
+  std::size_t offset = 0;
+  const auto version = binary::readLittleEndian<std::uint32_t>(payload, offset);
+  const auto count = binary::readLittleEndian<std::uint32_t>(payload, offset);
+  const auto next = binary::readLittleEndian<PageId>(payload, offset);
+  if (version != kChainedVersion || page.header().version != Page::kFormatVersionV2 ||
+      page.header().pageType != PageType::Metadata || count > kChunkCapacity ||
+      page.header().usedBytes != kChunkHeaderSize + count * PageDirectoryEntry::kSerializedSize) {
+    throw std::invalid_argument("Invalid page directory chunk");
+  }
+  for (std::uint32_t i = 0; i < count; ++i) {
+    PageDirectoryEntry entry;
+    entry.deserialize(payload.subspan(offset, PageDirectoryEntry::kSerializedSize));
+    offset += PageDirectoryEntry::kSerializedSize;
+    if (!entries_.emplace(entry.pageId, std::move(entry)).second) {
+      throw std::invalid_argument("Duplicate page directory entry detected");
+    }
+  }
+  return next;
 }
 
 } // namespace zenthrildb

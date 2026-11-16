@@ -3,18 +3,19 @@
 ## Scope
 
 This document defines the current transaction foundation in ZenthrilDB. The
-implemented layer manages transaction lifecycle state and writes durable
-transaction boundary records to WAL.
+implemented layer manages in-memory transaction lifecycle state and appends
+transaction boundary records to WAL. Appending does not itself request an OS
+durable flush.
 
 The current transaction layer does not implement:
 
 - MVCC
-- locks
+- lock acquisition/release integration
 - isolation levels
 - SQL transactions
 - savepoints
 - distributed transactions
-- undo/redo application
+- atomicity for writes that bypass `StorageMutationCoordinator` or span managers that were constructed with different LogManager/TransactionManager instances
 
 ## Transaction Identity
 
@@ -26,8 +27,7 @@ Properties:
 - `0` is invalid
 - identifiers are currently monotonic within a `TransactionManager` instance
 
-Future versions may persist the next transaction identifier or derive it from WAL
-recovery.
+The next identifier is reconstructed from retained lifecycle WAL records after restart. WAL compaction retains these records. There is no independent transaction catalog.
 
 ## Transaction State
 
@@ -36,14 +36,18 @@ Current states:
 | State | Meaning |
 |---|---|
 | `Active` | transaction is open |
-| `Committed` | transaction completed successfully |
-| `RolledBack` | transaction was rolled back |
+| `Committed` | durable commit record was synced before return |
+| `RolledBack` | durable rollback record was synced before return |
+| `CommitInDoubt` | commit record append/sync failed; resolve after reopen/recovery |
+| `RollbackInDoubt` | rollback record append/sync failed; resolve after reopen/recovery |
 
 Valid transitions:
 
 ```text
 Active -> Committed
 Active -> RolledBack
+Active -> CommitInDoubt
+Active -> RollbackInDoubt
 ```
 
 Invalid transitions:
@@ -93,19 +97,18 @@ Transaction payload format is defined in `docs/WAL_SPEC.md`.
 
 ## Durability Notes
 
-The transaction boundary is appended to WAL during lifecycle operations.
+`begin`, `commit`, and `rollback` append their lifecycle record through
+`LogManager::appendWithLsn()`, which syncs the WAL before returning. If commit or
+rollback synchronization fails after append, the corresponding in-doubt state is
+reported and the `LogManager` rejects further writes until it is reopened.
+`TransactionId` is reconstructed from retained lifecycle records; WAL compaction
+keeps these records.
 
-The current implementation does not yet define a full force/no-force or
-steal/no-steal buffer policy. Therefore, transaction records are durable events,
-but they do not yet provide complete ACID transaction semantics.
+This is durability of lifecycle records only. Page modifications are not
+transactionally coupled to `TransactionManager`, arbitrary rollback is absent,
+and full ACID semantics are not implemented.
 
-Future transaction durability must define:
-
-- when WAL is flushed relative to page writes
-- how commit records become durable
-- whether commit waits for WAL flush
-- how rollback interacts with undo payloads
-- how recovery reconstructs active transaction state after crash
+Remaining transaction work is to couple every supported page mutation to WAL, define page-level locking and recovery, and ensure lock cleanup on commit/rollback. Current commit durability applies to the lifecycle record only.
 
 ## Race-Condition Requirements
 
@@ -117,7 +120,7 @@ The transaction layer must prevent:
 - concurrent terminal transitions
 - duplicate transaction identifiers
 
-Existing tests cover concurrent transaction creation and concurrent finalization.
+Tests cover concurrent transaction creation/finalization, durable lifecycle records, restart ID progression, and process termination after a successful COMMIT.
 
 ## Future MVCC Integration
 
@@ -153,9 +156,9 @@ RecoveryEngine
 
 ## Current Limitations
 
-- Transaction identifiers are not persisted across process restart.
+- Transaction identifiers are reconstructed from WAL lifecycle records; WAL compaction retains those records. No independent transaction catalog exists.
 - No transaction table recovery exists yet.
 - No isolation enforcement exists yet.
 - No conflict detection exists yet.
-- No deadlock detection exists yet. The current lock foundation uses timeout-based waiting.
+- `LockManager` has local wait-for graph detection and timeout-based waiting, but it is not wired into `TransactionManager`; no automatic lock release on transaction completion is provided.
 - No SQL-level transaction API exists yet.

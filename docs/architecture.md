@@ -57,9 +57,11 @@ after reopening a database, and synchronized updates to `PageDirectory`.
 ## Page Lifecycle
 
 `PageManager` controls user-page lifecycle beginning at `PAGE 4`. It allocates
-pages through `FreePageManager`, records local ownership metadata, rejects direct
-writes to reserved pages, validates pages through `FileManager`, and tracks dirty
-page identifiers until `flushDirtyPages()` is called.
+pages through `FreePageManager`, updates the persistent `PageDirectory` through
+`MetadataManager` in the same WAL mutation as page/free-list changes, rejects
+direct writes to reserved pages, validates pages through `FileManager`, and tracks
+dirty page identifiers until `flushDirtyPages()` is called. Production callers
+should use `DatabaseRuntime`, which owns and validates the complete manager graph.
 
 Freed pages are rewritten as `Free` pages before their identifiers return to the
 free-page list. CRC generation and verification remain centralized in
@@ -68,6 +70,16 @@ free-page list. CRC generation and verification remain centralized in
 `BufferManager` supports both the original manual `pin()` / `unpin()` API and a
 RAII `BufferPageGuard` returned by `pinGuard()`. New code should prefer the
 guard so pages are automatically unpinned when control leaves scope.
+
+## Heap Records (experimental)
+
+`RecordManager` exposes durable `put`, `get`, `erase`, and `scan` through
+`DatabaseRuntime`. A table root links checksummed `Overflow` pages; each page
+stores one versioned binary key/value record and the next page id. Insertion
+publishes the record and root link in one WAL transaction. Deletion updates
+the chain and frees the removed page in one WAL transaction. Startup validates
+the chain. Each record must fit in one page, and scans are linear. The on-disk layout is
+specified in `docs/RECORD_FORMAT_RU.md` and is not yet declared stable.
 
 ## Future Compatibility
 
@@ -111,12 +123,22 @@ changing existing offsets.
 
 ### PageDirectory Payload
 
+The root stays at page ID `2`. Version 1 stores the directory in the root:
+
 - offset `0`: `uint32 format_version`
 - offset `4`: `uint32 entry_count`
 - offset `8`: fixed-size `PageDirectoryEntry` records
 
-The reader rejects unsupported versions, duplicate page identifiers, and entry
-counts that exceed page capacity.
+Version 2 keeps the first two fields, adds `PageId next_page_id` at offset `8`
+(`0` ends the chain), and starts entries at offset `12`. Each page contains up
+to 92 entries. The chain uses `Metadata` pages with strictly increasing IDs.
+Continuation pages are excluded from user directory entries and the free list.
+The reader checks format, entry counts, used bytes, link targets, and duplicate
+page IDs across the chain.
+
+The first allocation beyond 92 entries upgrades the directory in the same WAL
+transaction as the user page and database header. Later mutations journal only
+changed directory pages. Older binaries cannot read a directory after upgrade.
 
 ### FreePageList Payload
 
@@ -134,8 +156,8 @@ file. The WAL is intentionally independent from the storage file so future
 transaction recovery, replication, cloud shipping, and encryption can evolve
 without changing the database page format.
 
-This phase provides infrastructure only. It does not implement transactional
-commit/rollback semantics yet.
+This phase provides WAL infrastructure. Transaction lifecycle records exist, but
+page changes are not yet transactionally coupled to commit/rollback.
 
 ### WAL Record Layout
 
@@ -158,36 +180,37 @@ payload sizes, and CRC mismatches.
 
 - `LogSequenceNumber`: monotonic WAL identifier.
 - `LogRecord`: versioned, CRC-protected serialized event.
-- `WriteAheadLog`: append/read/flush/truncate file primitive.
+- `WriteAheadLog`: append/read/flush/truncate file primitive. `flush()` requests
+  OS-level durability; `append()` alone does not.
 - `LogManager`: thread-safe API for append, replay, checkpoint, and recovery context preparation.
 - `RecoveryContext`: container for future recovery planning.
 - `RecoveryManager`, `CrashRecovery`, `CheckpointManager`: extension interfaces for future transaction and crash recovery work.
 
 ### Recovery Strategy
 
-Future recovery will replay WAL records in LSN order after validating CRC and
-record versions. Checkpoint records provide safe recovery boundaries. Page and
-metadata records already carry typed payloads, but payload interpretation remains
-reserved for the future transaction layer.
+Recovery reads WAL records in LSN order after validating CRC and record versions.
+Checkpoint records are currently markers only; they do not authorize skipping
+older records because pages and checkpoint are not coordinated atomically. The
+explicit `RecoveryCoordinator` supports page-image recovery only.
 
 ## Recovery Engine Foundation
 
-`RecoveryEngine` currently performs recovery analysis only. It consumes a
-`RecoveryContext`, finds the latest checkpoint, and builds a `RecoveryPlan` from
-records at or after that checkpoint.
+`RecoveryEngine` analyzes WAL records and builds a `RecoveryPlan`. The limited
+page-image `RecoveryCoordinator` runs automatically inside
+`FileManager::openDatabase()` while the exclusive database lock is held. An open
+fails before exposing storage if WAL validation or recovery fails.
 
 Current action classifications:
 
 - page allocation, page free, and page write records become redo candidates
 - metadata records become metadata refresh candidates
-- checkpoint records define recovery boundaries
+- checkpoint records are retained as markers; the current coordinator replays WAL history before and after them
 - recovery markers are preserved for future diagnostics
 - database lifecycle records are ignored by the physical recovery planner
 
-This keeps crash recovery infrastructure in place without pretending that a full
-transaction engine exists. Future phases can attach redo/undo executors to
-`RecoveryPlan` once transaction records and page-delta payloads are formally
-defined.
+This keeps recovery infrastructure in place without claiming complete crash
+recovery. Page-image recovery is a limited execution path; allocation, free-page
+and metadata mutations are not comprehensively replayed.
 
 ### Replication Compatibility
 
@@ -214,26 +237,23 @@ Transaction WAL record types:
 - `TransactionCommitted`
 - `TransactionRolledBack`
 
-Each transaction record payload uses the versioned `TransactionPayload` format
-defined by `LogPayloadCodec`. Recovery analysis classifies these records as
-transaction boundaries so a future recovery executor can reconstruct transaction
-state before applying redo or undo logic.
-
-This design keeps the storage engine honest: transaction boundaries are durable
-and visible to recovery, while full transactional behavior is intentionally left
-for the next dedicated phase.
+Each transaction record uses the versioned `TransactionPayload`. Lifecycle calls
+sync each boundary record before returning. On restart, the next ID is reconstructed
+from retained lifecycle records. An explicit coordinator classifies page-image
+records as redo/undo, but arbitrary page changes are not connected to transaction
+lifecycle operations.
 
 ## Undo/Redo Recovery Foundation
 
-`UndoRedoRecoveryExecutor` is the first execution-facing recovery component. It
-does not mutate database pages directly. Instead, it depends on narrow
-`RedoApplier` and `UndoApplier` interfaces so future page, metadata, and
-transaction recovery logic can be attached without changing recovery planning.
+`UndoRedoRecoveryExecutor` is an execution-facing recovery component. It
+dispatches actions through narrow applier interfaces. A page-image applier exists
+for the supported page-image record path; this does not cover every page,
+metadata, or transaction mutation.
 
-The executor is intentionally idempotent per LSN. If the same recovery plan is
-submitted more than once, already-applied LSNs are skipped. This protects future
-crash-recovery code from duplicate application windows and race-prone retry
-loops.
+The executor tracks applied LSNs in memory for one executor instance. A new
+process does not retain that set; page-image REDO uses persisted Page LSN, while
+UNDO reapplies the before-image. Process-level tests exercise a second coordinator
+pass.
 
 Current behavior:
 
@@ -242,10 +262,9 @@ Current behavior:
 - checkpoints, markers, transaction boundaries, ignored records, and zero LSNs are skipped
 - execution is mutex-protected so concurrent recovery attempts cannot apply the same LSN twice
 
-Typed WAL payloads now define the basic page, metadata, and transaction boundary
-contracts. Future phases will extend these contracts with page images, page
-deltas, and transaction ownership semantics. Until those execution payloads
-exist, this layer remains a safe scaffold rather than a full recovery algorithm.
+Typed WAL payloads define page, metadata, page-image, and transaction boundary
+contracts. The supported page-image path is tested, while general transactional
+recovery and complete crash recovery remain unimplemented.
 
 ## Typed WAL Payload Format
 

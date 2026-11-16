@@ -2,6 +2,7 @@
 
 #include "core/Types.hpp"
 #include "storage/PageHeader.hpp"
+#include "storage/Page.hpp"
 
 #include <array>
 #include <cstdint>
@@ -42,13 +43,22 @@ struct PageDirectoryEntry {
 class PageDirectory {
 public:
   static constexpr std::uint32_t kMetadataVersion = 1;
+  static constexpr std::uint32_t kChainedVersion = 2;
+  static constexpr std::size_t kSinglePageCapacity =
+    (Page::kV2PayloadSize - 2 * sizeof(std::uint32_t)) / PageDirectoryEntry::kSerializedSize;
+  static constexpr std::size_t kChunkHeaderSize = 2 * sizeof(std::uint32_t) + sizeof(PageId);
+  static constexpr std::size_t kChunkCapacity =
+    (Page::kV2PayloadSize - kChunkHeaderSize) / PageDirectoryEntry::kSerializedSize;
 
   void registerPage(const PageDirectoryEntry& entry);
   void unregisterPage(PageId pageId);
   [[nodiscard]] const PageDirectoryEntry* get(PageId pageId) const;
+  [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
   [[nodiscard]] std::vector<PageDirectoryEntry> entries() const;
   [[nodiscard]] std::array<Byte, kDefaultPageSize - PageHeader::serializedSize()> serialize() const;
   void deserialize(std::span<const Byte> bytes);
+  [[nodiscard]] static Page serializeChunk(PageId id, PageId next, std::span<const PageDirectoryEntry> entries);
+  [[nodiscard]] PageId deserializeChunk(const Page& page);
 
 private:
   std::unordered_map<PageId, PageDirectoryEntry> entries_;

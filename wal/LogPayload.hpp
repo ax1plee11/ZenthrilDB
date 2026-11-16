@@ -2,6 +2,7 @@
 
 #include "core/Types.hpp"
 #include "storage/PageHeader.hpp"
+#include "storage/DatabaseHeader.hpp"
 #include "transaction/TransactionId.hpp"
 
 #include <array>
@@ -47,6 +48,13 @@ struct PageImageWrittenPayload {
   std::array<Byte, kDefaultPageSize> afterImage{};
 };
 
+struct DatabaseHeaderImageWrittenPayload {
+  TransactionId transactionId{};
+  std::uint64_t previousTxLsn{0};
+  std::array<Byte, DatabaseHeader::serializedSize()> beforeImage{};
+  std::array<Byte, DatabaseHeader::serializedSize()> afterImage{};
+};
+
 struct MetadataUpdatedPayload {
   MetadataPayloadKind kind{MetadataPayloadKind::DatabaseMetadata};
   PageId pageId{0};
@@ -58,12 +66,22 @@ struct TransactionPayload {
   TransactionId transactionId{};
 };
 
+struct SafeCheckpointPayload {
+  std::array<Byte, DatabaseHeader::kUuidSize> databaseUuid{};
+  std::array<Byte, 16> generation{};
+  std::uint64_t durableWalLsn{};
+  std::uint64_t transactionHighWater{};
+};
+
 class LogPayloadCodec {
 public:
   static constexpr std::uint32_t kPayloadFormatVersion = 1;
+  static constexpr std::size_t kSafeCheckpointPayloadSize = 52;
   static constexpr std::size_t kPageImageWrittenPayloadSize =
     sizeof(std::uint32_t) + sizeof(std::uint64_t) + sizeof(PageId) + sizeof(std::uint64_t) +
     sizeof(std::uint32_t) + kDefaultPageSize * 2;
+  static constexpr std::size_t kDatabaseHeaderImagePayloadSize =
+    sizeof(std::uint32_t) + sizeof(std::uint64_t) * 2 + DatabaseHeader::serializedSize() * 2;
 
   [[nodiscard]] static std::vector<Byte> encodePageAllocation(const PageAllocationPayload& payload);
   [[nodiscard]] static PageAllocationPayload decodePageAllocation(std::span<const Byte> bytes);
@@ -76,12 +94,18 @@ public:
 
   [[nodiscard]] static std::vector<Byte> encodePageImageWritten(const PageImageWrittenPayload& payload);
   [[nodiscard]] static PageImageWrittenPayload decodePageImageWritten(std::span<const Byte> bytes);
+  [[nodiscard]] static std::vector<Byte> encodeDatabaseHeaderImageWritten(
+    const DatabaseHeaderImageWrittenPayload& payload);
+  [[nodiscard]] static DatabaseHeaderImageWrittenPayload decodeDatabaseHeaderImageWritten(
+    std::span<const Byte> bytes);
 
   [[nodiscard]] static std::vector<Byte> encodeMetadataUpdated(const MetadataUpdatedPayload& payload);
   [[nodiscard]] static MetadataUpdatedPayload decodeMetadataUpdated(std::span<const Byte> bytes);
 
   [[nodiscard]] static std::vector<Byte> encodeTransaction(const TransactionPayload& payload);
   [[nodiscard]] static TransactionPayload decodeTransaction(std::span<const Byte> bytes);
+  [[nodiscard]] static std::vector<Byte> encodeSafeCheckpoint(const SafeCheckpointPayload& payload);
+  [[nodiscard]] static SafeCheckpointPayload decodeSafeCheckpoint(std::span<const Byte> bytes);
 };
 
 } // namespace zenthrildb

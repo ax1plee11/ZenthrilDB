@@ -15,6 +15,11 @@ public:
     : std::runtime_error("Commit record was appended but WAL durability is unknown") {}
 };
 
+class RollbackOutcomeUnknown final : public std::runtime_error {
+public:
+  RollbackOutcomeUnknown() : std::runtime_error("Rollback record durability is unknown") {}
+};
+
 class TransactionLogAdapter {
 public:
   explicit TransactionLogAdapter(LogManager& logManager) noexcept;

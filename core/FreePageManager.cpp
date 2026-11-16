@@ -4,26 +4,85 @@
 #include "storage/BinaryFormat.hpp"
 
 #include <stdexcept>
+#include <limits>
+#include <algorithm>
 #include <unordered_set>
 
 namespace zenthrildb {
 
-FreePageManager::FreePageManager(FileManager& fileManager)
-  : fileManager_(fileManager) {}
+FreePageManager::FreePageManager(FileManager& fileManager, StorageMutationCoordinator& mutationCoordinator)
+  : fileManager_(fileManager), mutationCoordinator_(&mutationCoordinator) {}
+
+StorageMutationCoordinator& FreePageManager::mutations() const {
+  if (!mutationCoordinator_) throw std::logic_error("Read-only free-page manager");
+  return *mutationCoordinator_;
+}
 
 PageId FreePageManager::allocatePage() {
   std::lock_guard lock(mutex_);
+  const auto beforeHeader = fileManager_.header();
+  PageId pageId{};
   if (auto recycled = freePages_.acquire()) {
-    return *recycled;
+    pageId = *recycled;
+  } else {
+    if (beforeHeader.totalPages > std::numeric_limits<PageId>::max()) {
+      throw std::overflow_error("Page identifier space exhausted");
+    }
+    pageId = static_cast<PageId>(beforeHeader.totalPages);
   }
-  return fileManager_.reservePageId();
+  Page reserved;
+  reserved.header().pageId = pageId;
+  reserved.header().pageType = PageType::Reserved;
+  const auto finalCount = std::max<std::uint64_t>(beforeHeader.totalPages,
+    static_cast<std::uint64_t>(pageId) + 1);
+  mutations().writePagesAtomically({reserved, serializeFreeListPage()}, beforeHeader, finalCount);
+  return pageId;
+}
+
+PageId FreePageManager::allocatePageDeferred() {
+  std::lock_guard lock(mutex_);
+  PageId pageId{};
+  if (auto recycled = freePages_.acquire()) {
+    pageId = *recycled;
+  } else {
+    auto candidate = fileManager_.header().totalPages;
+    while (candidate <= std::numeric_limits<PageId>::max() &&
+           pendingAllocations_.contains(static_cast<PageId>(candidate))) {
+      ++candidate;
+    }
+    if (candidate > std::numeric_limits<PageId>::max()) {
+      throw std::overflow_error("Page identifier space exhausted");
+    }
+    pageId = static_cast<PageId>(candidate);
+  }
+  if (!pendingAllocations_.insert(pageId).second) {
+    throw std::logic_error("Page id is already reserved by an unfinished storage mutation");
+  }
+  return pageId;
+}
+
+void FreePageManager::completeDeferredAllocation(PageId pageId) {
+  std::lock_guard lock(mutex_);
+  if (pendingAllocations_.erase(pageId) != 1) {
+    throw std::logic_error("Page id has no pending allocation");
+  }
 }
 
 void FreePageManager::freePage(PageId pageId) {
+  freePageDeferred(pageId);
+  Page page;
+  page.header().pageId = pageId;
+  page.header().pageType = PageType::Free;
+  std::lock_guard lock(mutex_);
+  mutations().writePagesAtomically({page, serializeFreeListPage()});
+}
+
+void FreePageManager::freePageDeferred(PageId pageId) {
   std::lock_guard lock(mutex_);
   if (pageId < kFirstUserPageId) {
     throw std::invalid_argument("Reserved page cannot be added to free page list");
   }
+  if (!freePages_.contains(pageId)) checkFreeListCapacityLocked(1);
   freePages_.add(pageId);
 }
 
@@ -37,14 +96,36 @@ void FreePageManager::save() {
   persistFreeListToDisk();
 }
 
+Page FreePageManager::snapshotFreeListPage() const {
+  std::lock_guard lock(mutex_);
+  return serializeFreeListPage();
+}
+
+void FreePageManager::checkFreeListCapacity(std::size_t additionalPages) const {
+  std::lock_guard lock(mutex_);
+  checkFreeListCapacityLocked(additionalPages);
+}
+
+void FreePageManager::checkFreeListCapacityLocked(std::size_t additionalPages) const {
+  constexpr auto capacity = (Page::kV2PayloadSize - format::kFreePageListEntriesOffset) / sizeof(PageId);
+  if (freePages_.size() > capacity || additionalPages > capacity - freePages_.size()) {
+    throw std::length_error("Database free-page list is full");
+  }
+}
+
 Page FreePageManager::buildFreePage() const {
   Page page;
+  page.header().version = Page::kFormatVersionV2;
   page.header().pageType = PageType::Free;
   page.header().usedBytes = 0;
   return page;
 }
 
 void FreePageManager::persistFreeListToDisk() {
+  mutations().writePagesAtomically({serializeFreeListPage()});
+}
+
+Page FreePageManager::serializeFreeListPage() const {
   auto page = buildFreePage();
   page.header().pageId = kFreePageListPageId;
   auto payload = page.payload();
@@ -63,7 +144,7 @@ void FreePageManager::persistFreeListToDisk() {
     binary::writeLittleEndian<PageId>(payload, offset, pageId);
   }
   page.header().usedBytes = static_cast<std::uint32_t>(offset);
-  fileManager_.writePage(page);
+  return page;
 }
 
 void FreePageManager::loadFreeListFromDisk() {

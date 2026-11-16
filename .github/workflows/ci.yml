@@ -10,16 +10,152 @@ permissions:
 
 jobs:
   test:
+    name: ${{ matrix.os }} / ${{ matrix.configuration }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, windows-latest]
+        configuration: [Debug, Release]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Configure Debug build
-        run: cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=Debug -DZENTHRILDB_BUILD_TESTS=ON
+      - name: Configure
+        run: cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} -DZENTHRILDB_BUILD_TESTS=ON
       - name: Build
-        run: cmake --build build-ci --config Debug --parallel 2
+        run: cmake --build build-ci --config ${{ matrix.configuration }} --parallel 2
       - name: Test
-        run: ctest --test-dir build-ci -C Debug --output-on-failure --timeout 60
+        run: ctest --test-dir build-ci -C ${{ matrix.configuration }} --output-on-failure --no-tests=error --timeout 300
+      - name: Install
+        run: cmake --install build-ci --config ${{ matrix.configuration }} --prefix build-ci/install
+      - name: Exercise installed CLI and verify an independent restore
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $executableName = if ($IsWindows) { 'zenthrildb.exe' } else { 'zenthrildb' }
+          $cli = (Resolve-Path "build-ci/install/bin/$executableName").Path
+          $work = Join-Path $env:RUNNER_TEMP 'zenthrildb cli smoke'
+          New-Item -ItemType Directory -Path $work | Out-Null
+          $database = Join-Path $work 'sample.zdb'
+          $pairNames = @('sample.zdb', 'sample.wal')
+          $backup = Join-Path $work 'backup'
+          $restoreDirectory = Join-Path $work 'restore'
+          $restored = Join-Path $restoreDirectory 'sample.zdb'
+
+          function Invoke-Database {
+            & $cli @args
+            if ($LASTEXITCODE -ne 0) {
+              throw "ZenthrilDB command '$($args[0])' failed with exit code $LASTEXITCODE"
+            }
+          }
+
+          function Get-DatabasePairHashes([string] $Directory) {
+            $hashes = @{}
+            foreach ($name in $pairNames) {
+              $hashes[$name] = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Directory $name)).Hash
+            }
+            return $hashes
+          }
+
+          function Assert-DatabasePairHashes([string] $Directory, [hashtable] $Expected) {
+            $actual = Get-DatabasePairHashes $Directory
+            foreach ($name in $pairNames) {
+              if ($actual[$name] -cne $Expected[$name]) {
+                throw "SHA-256 mismatch for $(Join-Path $Directory $name)"
+              }
+            }
+          }
+
+          Invoke-Database create $database
+          Invoke-Database create-table $database events
+          Invoke-Database put $database events key '76616c7565'
+          if ((Invoke-Database get $database events key) -cne '76616c7565') {
+            throw 'Value read from the reopened database did not match'
+          }
+          Invoke-Database check $database
+          $walPath = Join-Path $work 'sample.wal'
+          $walBefore = [IO.File]::ReadAllBytes($walPath)
+          $checkpoint = Invoke-Database checkpoint $database | ConvertFrom-Json
+          $walAfter = [IO.File]::ReadAllBytes($walPath)
+          if ($checkpoint.durable_wal_lsn -ge $checkpoint.checkpoint_lsn -or
+              $checkpoint.transaction_high_water -lt 1 -or $walAfter.Length -le $walBefore.Length) {
+            throw 'Invalid checkpoint boundary or WAL size'
+          }
+          for ($index = 0; $index -lt $walBefore.Length; $index++) {
+            if ($walBefore[$index] -ne $walAfter[$index]) { throw 'Checkpoint changed existing WAL bytes' }
+          }
+          if ((Invoke-Database get $database events key) -cne '76616c7565') {
+            throw 'Confirmed value missing after checkpoint reopen'
+          }
+          $sourceBeforeSnapshot = Get-DatabasePairHashes $work
+          $snapshot = Join-Path $work 'snapshot'
+          Invoke-Database snapshot $database $snapshot
+          $snapshotData = Join-Path $snapshot 'sample.zdb'
+          $verified = Invoke-Database verify-snapshot $snapshotData | ConvertFrom-Json
+          if ($verified.snapshot_lsn -lt $checkpoint.checkpoint_lsn -or
+              $verified.transaction_high_water -ne $checkpoint.transaction_high_water -or
+              $verified.pages_checked -lt 4) {
+            throw 'Invalid snapshot boundary or page count'
+          }
+          $sidecarNames = @('sample.zdb.baseline', 'sample.zdb.snapshot')
+          $baselineDirectory = Join-Path $work 'baseline only'
+          New-Item -ItemType Directory -Path $baselineDirectory | Out-Null
+          foreach ($name in $sidecarNames) {
+            Copy-Item -LiteralPath (Join-Path $snapshot $name) -Destination $baselineDirectory
+          }
+          $independent = Invoke-Database verify-baseline (Join-Path $baselineDirectory 'sample.zdb') | ConvertFrom-Json
+          if ($independent.snapshot_lsn -ne $verified.snapshot_lsn -or
+              $independent.pages_checked -ne $verified.pages_checked) {
+            throw 'Independent baseline verification disagrees with the published snapshot'
+          }
+          Invoke-Database check $snapshotData
+          if ((Invoke-Database get $snapshotData events key) -cne '76616c7565') {
+            throw 'Snapshot did not retain the confirmed value'
+          }
+          $snapshotHashes = Get-DatabasePairHashes $snapshot
+          & $cli snapshot $database $snapshot
+          if ($LASTEXITCODE -eq 0) { throw 'Snapshot accepted an existing destination' }
+          Assert-DatabasePairHashes $snapshot $snapshotHashes
+          Assert-DatabasePairHashes $work $sourceBeforeSnapshot
+          Invoke-Database put $snapshotData events newer '6e65776572'
+          Invoke-Database checkpoint $snapshotData
+          $snapshotBackup = Join-Path $work 'snapshot backup'
+          Invoke-Database backup $snapshotData $snapshotBackup
+          $snapshotBackupData = Join-Path $snapshotBackup 'sample.zdb'
+          Invoke-Database verify-snapshot $snapshotBackupData
+          foreach ($name in ($pairNames + $sidecarNames)) {
+            $originalHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $snapshot $name)).Hash
+            $copyHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $snapshotBackup $name)).Hash
+            if ($originalHash -cne $copyHash) { throw "SHA-256 mismatch for backed up snapshot file $name" }
+          }
+          if ((Invoke-Database get $snapshotBackupData events newer) -cne '6e65776572') {
+            throw 'Backed up snapshot lost its post-boundary transaction'
+          }
+          Invoke-Database backup $database $backup
+          $baseline = Get-DatabasePairHashes $backup
+          Assert-DatabasePairHashes $work $baseline
+
+          New-Item -ItemType Directory -Path $restoreDirectory | Out-Null
+          $backupFiles = $pairNames | ForEach-Object { Join-Path $backup $_ }
+          Copy-Item -LiteralPath $backupFiles -Destination $restoreDirectory
+          Invoke-Database erase $database events key
+          & $cli get $database events key
+          if ($LASTEXITCODE -ne 3) {
+            throw 'Erased key should be reported as missing from the source database'
+          }
+          $sourceAfterErase = Get-DatabasePairHashes $work
+
+          Assert-DatabasePairHashes $backup $baseline
+          Assert-DatabasePairHashes $restoreDirectory $baseline
+          Invoke-Database check $restored
+          if ((Invoke-Database get $restored events key) -cne '76616c7565') {
+            throw 'Value read from the reopened backup did not match'
+          }
+          Invoke-Database put $restored events key '636f7079'
+          if ((Invoke-Database get $restored events key) -cne '636f7079') {
+            throw 'Restored database did not retain the updated value'
+          }
+          Assert-DatabasePairHashes $backup $baseline
+          Assert-DatabasePairHashes $work $sourceAfterErase
+          exit 0

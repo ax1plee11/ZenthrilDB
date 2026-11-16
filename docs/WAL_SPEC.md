@@ -1,10 +1,12 @@
 # ZenthrilDB WAL Specification
 
+Stage 4 defines an additional bound-WAL record type 14. The header, CRC, and type 7 remain unchanged. [SafeCheckpoint payload and validation](SAFE_CHECKPOINT_RU.md).
+
 ## Scope
 
 This document defines the Write-Ahead Log format used by ZenthrilDB. The WAL is
 an independent binary file stored separately from the `.zdb` database file. Its
-purpose is to provide a durable event stream for future crash recovery,
+purpose is to provide a checksummed event stream for future crash recovery,
 transaction recovery, replication, cloud shipping, and audit-oriented inspection.
 
 This specification describes infrastructure only. It does not claim that full
@@ -68,6 +70,7 @@ larger payload sizes before allocating payload buffers.
 | `10` | `TransactionCommitted` | transaction boundary |
 | `11` | `TransactionRolledBack` | transaction boundary |
 | `12` | `PageImageWritten` | full before/after page image for physical recovery |
+| `13` | `DatabaseHeaderImageWritten` | transactional before/after database header image |
 
 ## Typed Payload Version
 
@@ -150,7 +153,18 @@ Used by `PageImageWritten` for transactional physical recovery. It contains the
 transaction ID, page ID, previous transaction LSN, page-format version, and
 two complete 8192-byte, CRC-protected page images: the state before and after
 the change. During recovery, committed transactions redo the after-image and
-incomplete transactions undo the before-image in reverse LSN order.
+incomplete or explicitly rolled-back transactions undo the before-image in
+reverse LSN order. The applier verifies the image Page LSN against the WAL record LSN.
+
+## DatabaseHeaderImageWritten Payload
+
+This version 1 payload stores transaction ID, previous transaction LSN, and
+complete serialized before/after images of the database file header prefix.
+Both images must pass the database header checksum and format checks. Recovery
+uses the transaction outcome to restore the selected image; when UNDO reduces
+`totalPages`, it truncates the physical file to the restored page count. This
+record type is used by `StorageMutationCoordinator` when a page-set mutation
+changes `totalPages`.
 
 ## Transaction Payload
 
@@ -180,10 +194,15 @@ Used by:
 - Unsupported payload versions must fail closed.
 - Future encrypted WAL support should wrap payload bytes or full records without changing logical record definitions.
 
-## Current Limitations
+## Durability and Current Limitations
 
-- Page-image recovery currently covers page modifications recorded as
-  `PageImageWritten`; allocation, freeing and metadata operations still need
-  physical recovery records.
-- WAL truncation exists as an infrastructure primitive and must be used carefully until checkpoint durability rules are finalized.
-- Existing `.wal` files produced before explicit little-endian WAL frame encoding are not guaranteed to be portable across architectures.
+- `WriteAheadLog::append()` appends a framed record and checks stream errors, but does not force it to storage.
+- `LogManager::appendWithLsn()` performs append followed by `WriteAheadLog::flush()`. That flushes the stream and calls `FlushFileBuffers` on Windows or `fsync` on POSIX; errors propagate. A sync failure poisons that `LogManager` instance so later appends fail until reopen/recovery.
+- Transaction `begin`, `commit`, and `rollback`, and checkpoint creation use the durable append path. A successful COMMIT confirms the commit record was synced by the OS interface before returning. `StorageMutationCoordinator` provides WAL-before-data page/header image transactions for managers wired to the same LogManager and TransactionManager. Direct low-level FileManager writes remain outside that guarantee.
+- Page `FileManager::flush()` now flushes the stream and requests the same OS file sync. A single page write can still tear; CRC detects damage but cannot restore data without a valid page-image WAL record.
+- On startup, only an incomplete final frame (short header or short payload at EOF) is truncated to the last complete frame and synced. A complete frame with invalid magic/version/CRC or an oversized payload fails closed. Mid-file corruption is not repaired.
+- WAL compaction writes and syncs a sibling temporary file, atomically replaces the WAL, then syncs the parent directory on POSIX (Windows uses `MOVEFILE_WRITE_THROUGH`). Transaction lifecycle records are retained to preserve the Transaction ID high-water mark. Full checkpoint-based WAL reclamation is not implemented.
+- `FileManager::openDatabase()` now holds an exclusive process lock and automatically runs `RecoveryCoordinator` before returning. The coordinator validates page LSNs against the canonical sibling WAL, replays page-image actions, then syncs recovered pages and WAL. Missing WAL fails closed. An empty WAL is accepted only when no persisted page LSN claims a positive LSN; this does not prove that pages written without WAL are recoverable.
+- При открытии проверяются сигнатура, версия, размер страницы и границы числа страниц заголовка базы. UUID обоих исторических образов заголовка сверяются с UUID базы. У связанных WAL префикс проверяет UUID, поколение и LSN снимка до REDO/UNDO и обрезки хвоста, независимо от типов кадров. Обычные кадры сохраняют описание из этого документа. [Формат префикса и совместимость](WAL_IDENTITY_RU.md)
+- Allocation/free/metadata transactions have no full physical before/after recovery path. There is no general transaction/page/lock integration or full ACID guarantee. A successful COMMIT proves durability of the commit record, not arbitrary data-page updates.
+- Process-kill tests cover durable COMMIT, page-image REDO/UNDO, and a second recovery pass. They do not kill the process inside kernel writes/sync calls, simulate power loss, or prove behavior of every filesystem/controller. Hardware power-loss durability is not claimed.

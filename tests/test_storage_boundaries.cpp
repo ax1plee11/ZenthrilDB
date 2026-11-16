@@ -3,6 +3,11 @@
 #include "storage/BinaryFormat.hpp"
 #include "storage/DatabaseMetadata.hpp"
 #include "storage/PageDirectory.hpp"
+#include "tests/TestDatabaseFiles.hpp"
+#include "storage/DatabaseWalPath.hpp"
+#include "transaction/StorageMutationCoordinator.hpp"
+#include "transaction/TransactionManager.hpp"
+#include "wal/LogManager.hpp"
 
 #include <array>
 #include <cassert>
@@ -80,20 +85,22 @@ void test_storage_boundaries() {
   });
 
   const auto path = std::filesystem::temp_directory_path() / "zenthrildb_boundaries.zdb";
-  if (std::filesystem::exists(path)) {
-    std::filesystem::remove(path);
-  }
+  removeTestDatabaseArtifacts(path);
 
   FileManager fm;
   fm.createDatabase(path);
-  FreePageManager freePages(fm);
+  LogManager wal(databaseWalPath(path));
+  TransactionManager transactions(wal);
+  StorageMutationCoordinator coordinator(fm, wal, transactions);
+  FreePageManager freePages(fm, coordinator);
   expectThrow<std::invalid_argument>([&] {
     freePages.freePage(kDatabaseMetadataPageId);
   });
-  freePages.freePage(kFirstUserPageId);
-  freePages.freePage(kFirstUserPageId);
+  const auto pageId = freePages.allocatePage();
+  freePages.freePage(pageId);
+  freePages.freePage(pageId);
   assert(freePages.freePages().size() == 1);
 
   fm.closeDatabase();
-  std::filesystem::remove(path);
+  removeTestDatabaseArtifacts(path);
 }

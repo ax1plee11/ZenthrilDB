@@ -2,7 +2,9 @@
 #include "wal/LogRecord.hpp"
 #include "wal/WriteAheadLog.hpp"
 #include "wal/LogPayload.hpp"
+#include "transaction/TransactionManager.hpp"
 #include "storage/Page.hpp"
+#include "storage/DurableFileSync.hpp"
 
 #include <cassert>
 #include <filesystem>
@@ -280,6 +282,14 @@ void test_wal() {
     std::filesystem::remove(concurrentLsnPath);
   }
 
+  {
+    const auto missingPath = tempWalPath("zenthrildb_missing_sync_target.wal");
+    bool syncFailed = false;
+    try { detail::syncFileToStorage(missingPath); }
+    catch (const std::system_error&) { syncFailed = true; }
+    assert(syncFailed);
+  }
+
   const auto path = tempWalPath("zenthrildb_test.wal");
   {
     LogManager log(path);
@@ -305,8 +315,10 @@ void test_wal() {
     assert(next == LogSequenceNumber{4});
     reopened.truncate(LogSequenceNumber{2});
     const auto records = reopened.replay();
-    assert(records.size() == 2);
+    assert(records.size() == 3);
     assert(records.front().lsn() == LogSequenceNumber{3});
+    assert(records.back().type() == LogRecordType::Checkpoint);
+    assert(records.back().lsn() == LogSequenceNumber{5});
   }
 
   {
@@ -344,6 +356,48 @@ void test_wal() {
       assert(log.replay().size() == 8);
     }
     std::filesystem::remove(concurrentPath);
+  }
+
+  {
+    const auto transactionPath = tempWalPath("zenthrildb_wal_truncate_keeps_tx_ids.wal");
+    TransactionId originalId{};
+    {
+      LogManager log(transactionPath);
+      TransactionManager transactions(log);
+      const auto transaction = transactions.begin();
+      originalId = transaction.id();
+      transactions.commit(originalId);
+      log.truncate(LogSequenceNumber{99});
+    }
+    {
+      LogManager reopened(transactionPath);
+      TransactionManager transactions(reopened);
+      assert(transactions.begin().id().value() > originalId.value());
+    }
+    std::filesystem::remove(transactionPath);
+  }
+
+  {
+    const auto tornPath = tempWalPath("zenthrildb_torn_tail.wal");
+    {
+      LogManager log(tornPath);
+      (void)log.appendWithLsn(LogRecordType::DatabaseCreated,
+        [](LogSequenceNumber) { return payload({0x11, 0x22}); });
+    }
+    const auto validSize = std::filesystem::file_size(tornPath);
+    {
+      std::ofstream tail(tornPath, std::ios::binary | std::ios::app);
+      const char bytes[] = {0x5A, 0x57, 0x41};
+      tail.write(bytes, sizeof(bytes));
+    }
+    {
+      LogManager reopened(tornPath);
+      const auto records = reopened.replay();
+      assert(records.size() == 1);
+      assert(reopened.hadIncompleteWalTail());
+      assert(std::filesystem::file_size(tornPath) == validSize);
+    }
+    std::filesystem::remove(tornPath);
   }
 
   {

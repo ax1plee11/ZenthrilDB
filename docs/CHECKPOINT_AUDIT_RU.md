@@ -1,0 +1,18 @@
+# Аудит checkpoint до Stage 4
+
+Прикладная мутация идёт по цепочке `DatabaseRuntime → RecordManager → PageManager/MetadataManager → StorageMutationCoordinator → LogManager и FileManager`. Runtime удерживает общий мьютекс операции, а FileManager удерживает межпроцессный sidecar-lock по пути базы. `BufferManager` и самостоятельный `LockManager` в этот путь не входят.
+
+| Файл и функция | Наблюдение и риск | Решение Stage 4 |
+|---|---|---|
+| `recovery/CheckpointService.cpp::checkpoint`, `wal/LogManager.cpp::checkpoint` | Пустой маркер типа 7 синхронизируется независимо от файла базы. Он не выражает границу сохранности. | Сохранить старый API маркера, добавить режим долговечной границы через runtime. |
+| `wal/LogManager.hpp::appendWithLsn`, `wal/LogManager.cpp::readValidated` | LSN резервируется до сериализации, ошибки могут оставить пропуск. Обычный append буферизован, durable append синхронизирует. Извлечение последнего валидного LSN само по себе не доказывает запись на носитель. Ошибка синхронизации блокирует дальнейший append на экземпляре. | Сверять границу с предыдущим полным кадром и подтверждать системную синхронизацию. |
+| `transaction/StorageMutationCoordinator.cpp::writePagesAtomically`, `transaction/TransactionManager.cpp::commit` | Полный образ заголовка/страницы синхронизируется до записи соответствующего файла данных. Файл синхронизируется перед COMMIT. Ошибка останавливает запись через FileManager. | Блокировать новые операции на весь checkpoint. Использовать существующий WAL-before-data, подтверждать WAL и текущие страницы. |
+| `core/PageManager.cpp::flushDirtyPages` | Список помечает уже записанные страницы. Буфера неподтверждённых данных здесь нет. Очистка происходит после успешного FileManager::flush. | Применить этот барьер в checkpoint. |
+| `core/BufferManager.cpp::pin`, `flushAll`, `evictIfNeeded` | Guard закрепляет страницу, но не защищает её содержимое мьютексом. Отдельный менеджер пишет напрямую через FileManager, в том числе при вытеснении. | Оставить вне рабочего runtime. Подключение требует отдельного контракта dirty page/LSN и синхронизации WAL. |
+| `core/FileManager.cpp::writePage`, `flush`, `openDatabase` | Есть файловая запись и отдельная системная синхронизация. Прямой низкоуровневый writePage обходит WAL. При открытии recovery проверяет пару под блокировкой. | Checkpoint доступен через runtime связанной базы, с read-only сверкой с планом восстановления. |
+| `recovery/RecoveryCoordinator.cpp::recoverBound`, `RecoveryEngine.cpp::analyze` | Восстановление использует всю историю, включая старые образы до snapshot LSN. Исторический незавершённый BEGIN остаётся в WAL после восстановления. | Не использовать checkpoint для пропуска анализа. Проверять, что страницы и заголовок уже совпадают с итоговым планом. |
+| `storage/WalIdentity.cpp`, `core/DatabaseRuntime.cpp::snapshotTo` | UUID сохраняется, снимок меняет поколение и копирует историю записей побайтно. Исторические границы относятся к родительским поколениям. | Сверять UUID всей истории. Поколение сверять для маркеров после границы снимка. |
+
+До checkpoint поток данных уже включает системные барьеры `WAL image → запись страницы → sync базы → COMMIT + sync WAL`. Новый путь добавляет `freeze runtime → проверка плана и метаданных → sync WAL → sync базы → append границы → sync WAL → подтверждение`. Отдельный файл и публикация через rename не требуются.
+
+Изменения затрагивают CheckpointService, DatabaseRuntime, RecoveryCoordinator, LogManager, WriteAheadLog, тип и кодек WAL, CLI, точки отказа, тесты, документацию и CMake. Область гарантий — штатный runtime под блокировкой в доверенном каталоге. Поддержка сторонней записи напрямую в те же файлы не предусмотрена.

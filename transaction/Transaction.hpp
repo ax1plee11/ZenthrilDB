@@ -11,6 +11,7 @@ enum class TransactionState {
   Committed,
   RolledBack,
   CommitInDoubt,
+  RollbackInDoubt,
 };
 
 class Transaction {
@@ -26,6 +27,7 @@ public:
   void markCommitted(std::uint64_t finishedAtUnixNs) noexcept;
   void markRolledBack(std::uint64_t finishedAtUnixNs) noexcept;
   void markCommitInDoubt(std::uint64_t finishedAtUnixNs) noexcept;
+  void markRollbackInDoubt(std::uint64_t finishedAtUnixNs) noexcept;
 
 private:
   TransactionId id_{};

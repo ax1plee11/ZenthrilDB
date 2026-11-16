@@ -27,6 +27,9 @@ TransactionManager::TransactionManager(LogManager& logManager)
 
 Transaction TransactionManager::begin() {
   std::lock_guard lock(mutex_);
+  if (nextId_ == 0 || nextId_ == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::overflow_error("Transaction id space exhausted");
+  }
   const TransactionId id{nextId_++};
   Transaction transaction{id, currentTimeUnixNs()};
   transactions_.emplace(id, transaction);
@@ -34,7 +37,6 @@ Transaction TransactionManager::begin() {
     (void)logAdapter_.recordBegin(id);
   } catch (...) {
     transactions_.erase(id);
-    --nextId_;
     throw;
   }
   return transaction;
@@ -55,7 +57,12 @@ void TransactionManager::commit(TransactionId id) {
 void TransactionManager::rollback(TransactionId id) {
   std::lock_guard lock(mutex_);
   auto& transaction = requireActive(id);
-  (void)logAdapter_.recordRollback(id);
+  try {
+    (void)logAdapter_.recordRollback(id);
+  } catch (const RollbackOutcomeUnknown&) {
+    transaction.markRollbackInDoubt(currentTimeUnixNs());
+    throw;
+  }
   transaction.markRolledBack(currentTimeUnixNs());
 }
 

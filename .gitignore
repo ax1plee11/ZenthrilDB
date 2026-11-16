@@ -27,3 +27,21 @@ tmp_wal_lsn_review/
 .vscode/
 .idea/
 .DS_Store
+
+# Local verification output
+build-audit/
+
+build-linux-audit/
+build-21/
+build-21-release/
+build-21-win/
+
+# Local database files and environment configuration
+*.zdb
+*.zdb.baseline
+*.zdb.snapshot
+*.zdb.lock
+*.wal
+.env
+.env.*
+!.env.example

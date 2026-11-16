@@ -87,6 +87,12 @@ void Page::deserialize(std::span<const Byte> bytes) {
   std::copy(bytes.begin(), bytes.end(), data_.begin());
   header_.deserialize(std::span<const Byte>(data_.data(), PageHeader::serializedSize()));
 
+  std::array<Byte, kDefaultPageSize> checksumBytes{};
+  std::copy(bytes.begin(), bytes.end(), checksumBytes.begin());
+  std::fill_n(checksumBytes.begin() + static_cast<std::ptrdiff_t>(sizeof(PageId) + sizeof(std::uint32_t)),
+              sizeof(std::uint32_t), Byte{0});
+  if (CRCManager::compute(checksumBytes) != header_.checksum) throw PageChecksumError{};
+
   const auto payloadCapacity = header_.version == kFormatVersionV1
     ? kV1PayloadSize
     : header_.version == kFormatVersionV2
@@ -106,14 +112,6 @@ void Page::deserialize(std::span<const Byte> bytes) {
     pageLsn_ = 0;
   }
 
-  std::array<Byte, kDefaultPageSize> checksumBytes{};
-  std::copy(bytes.begin(), bytes.end(), checksumBytes.begin());
-  const auto expectedChecksum = header_.checksum;
-  std::fill_n(checksumBytes.begin() + static_cast<std::ptrdiff_t>(sizeof(PageId) + sizeof(std::uint32_t)),
-              sizeof(std::uint32_t), Byte{0});
-  if (CRCManager::compute(checksumBytes) != expectedChecksum) {
-    throw std::invalid_argument("Page checksum verification failed");
-  }
 }
 
 } // namespace zenthrildb

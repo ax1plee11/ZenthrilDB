@@ -1,44 +1,33 @@
 # ZenthrilDB
 
-ZenthrilDB is an original C++23 storage engine foundation designed for local-first database persistence.
+ZenthrilDB — собственный C++23 storage engine для локального хранения. Сейчас это **исследовательская основа**, не готовая СУБД и не production-хранилище.
 
-## Status: Research component (not integrated with Go backend)
+ZenthrilDB интегрируется с отдельным проектом Zenthril через отдельный процесс и IPC. На этапе испытаний PostgreSQL остаётся основной БД и источником истины, Redis сохраняет сессии, кэш и ограничения запросов. Первый кандидат для испытаний — некритичные журналы событий и модерации. Аккаунты, сообщения и криптографические ключи не переносятся; E2EE не меняется.
 
-ZenthrilDB is a standalone research project. It is **not** integrated with the Zenthril Go backend, which uses PostgreSQL as its primary database. No decision has been made to adopt ZenthrilDB as a replacement for PostgreSQL.
+## Реализовано
 
-## Implemented subsystems
+- Формат `.zdb` с фиксированными страницами 8192 байта, little-endian поля и CRC32.
+- FileManager, PageManager, FreePageManager, MetadataManager и LRU BufferManager с RAII guard.
+- WAL в отдельном `.wal` файле: LSN, типизированные payload, CRC32, checkpoint.
+- Page-image WAL payload и `PageImageRecoveryApplier` для ограниченного физического REDO/UNDO страниц.
+- Базовый снимок нового поколения с манифестом, независимой проверкой и восстановлением с применением WAL после границы. [Спецификация](docs/SNAPSHOT_FOUNDATION_RU.md).
+- Record Manager с атомарной вставкой и удалением, проверкой цепочек записей при открытии и хранением каждой записи в одной странице. Формат описан в [документации](docs/RECORD_FORMAT_RU.md).
+- Устанавливаемая утилита `zenthrildb` для работы с таблицами и записями, проверки базы и резервного копирования. [Команды и установка](docs/CLI_RU.md). [Восстановление](docs/OPERATIONS_RU.md).
+- Анализ транзакционных границ и устойчивое выделение Transaction ID из WAL; полная ACID-изоляция ещё отсутствует.
+- Локальные shared/exclusive блокировки и очередь ожидания с таймаутами; wait-for graph.
 
-The following C++23 subsystems are implemented:
+## Готовность
 
-- Database file format
-- Page format and checksum validation
-- Binary file manager
-- CRC32 integrity checking
-- Basic LRU buffer management
-- Write-Ahead Log (WAL) — `wal/`
-- Crash recovery — `wal/RecoveryContext.*`
-- Transaction management — `transaction/`
-- Lock manager with wait-for graph — `lock/`
-- Free page management — `core/FreePageManager.*`
-- Future security interfaces — `core/EncryptionInterfaces.hpp`
+В предварительной версии доступны локальный KV CLI, автоматическое восстановление при открытии и многостраничный каталог страниц. На Windows x64 и Ubuntu 24.04 проходят Debug и Release сборки и тесты. Для v1.0 остаются многостраничные значения, B+Tree, SQL, транзакционная изоляция и испытания аппаратной долговечности. Критерии выпуска перечислены в [`docs/RELEASE_ACCEPTANCE_RU.md`](docs/RELEASE_ACCEPTANCE_RU.md).
 
-## Build
+## Сборка
 
-CMake-based build. See `CMakeLists.txt` for targets. Build artifacts (`.obj`) are present in this directory but are not part of the source tree.
+```powershell
+cmake -S . -B build -DZENTHRILDB_BUILD_TESTS=ON
+cmake --build build --config Debug --parallel
+ctest --test-dir build -C Debug --output-on-failure
+```
 
-## Project documentation
+Дорожная карта: [`docs/ROADMAP.md`](docs/ROADMAP.md). IPC-протокол и критерии прототипа: [`docs/IPC_INTEGRATION.md`](docs/IPC_INTEGRATION.md).
 
-The following design documents are planned but not yet present in this tree:
-
-- Architecture overview
-- Phased development roadmap
-- Change history
-- WAL binary specification
-- Recovery architecture and execution contract
-- Transaction lifecycle specification
-- Local lock manager specification
-- Architectural decision records (ADR)
-
-## Relationship to Zenthril
-
-ZenthrilDB is maintained in the same repository for provenance purposes but is developed independently. The Go backend (`backend/`) does not depend on ZenthrilDB and uses PostgreSQL.
+[Единая архитектура ZenthrilDB v1.0 и Fortress‑20](docs/architecture/DATABASE_ARCHITECTURE.md) описывает границы ядра и безопасности, совместимость формата и порядок приёмки.

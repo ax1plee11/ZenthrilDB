@@ -1,35 +1,17 @@
-# PROJECT TRUTH
+# Фактическое состояние ZenthrilDB
 
-## Scope
+Чистые сборки Stage 5 проверены на Windows x64 с Visual Studio 18 2026 и Ubuntu 24.04 с GCC 13.3, в Debug и Release. Во всех четырёх конфигурациях прошли четыре группы CTest. Проект предоставляет локальный KV CLI и остаётся предварительной версией 0.1.0. [Критерии релиза](docs/RELEASE_ACCEPTANCE_RU.md).
 
-Audited source: the supplied ZenthrilDB working tree. Zenthril source was not
-provided; all Zenthril-specific claims are therefore **UNVERIFIED**.
-
-| Component | Status | Evidence |
+| Область | Состояние | Граница доказательства |
 |---|---|---|
-| `.zdb`, fixed 8192-byte pages, little-endian structures | IMPLEMENTED | `core/Types.hpp`, `storage/Page.*`, `storage/BinaryIO.hpp` |
-| CRC32 header/page/WAL validation | IMPLEMENTED | `core/CRCManager.*`, `FileManager.cpp`, `LogRecord.cpp` |
-| File, metadata, free-page and page managers | IMPLEMENTED | `core/*`, `storage/*`, corresponding tests |
-| LRU buffer and RAII guard | IMPLEMENTED | `core/BufferManager.*`, `test_buffer_manager.cpp` |
-| WAL frame, LSN and typed payload | FOUNDATION | `wal/*`, `test_wal.cpp`, `test_log_payload.cpp` |
-| Transaction lifecycle boundaries | FOUNDATION | `transaction/*`, `test_transaction.cpp` |
-| Recovery planning/executor interfaces | FOUNDATION | `recovery/*`, `test_recovery.cpp` |
-| Physical redo/undo crash recovery | MISSING | no page-image/delta applier implementation |
-| Lock manager basic mode/timeouts | IMPLEMENTED | `lock/LockManager.*`, `test_lock_manager.cpp` |
-| Wait-for graph/deadlock handling | PARTIAL | source exists; no dedicated cycle test supplied |
-| Encryption | MISSING | interfaces only: `core/EncryptionInterfaces.hpp` |
-| MVCC, B+Tree, SQL, replication | PLANNED | `docs/ROADMAP.md` |
-| Zenthril integration | UNVERIFIED | Zenthril repository absent |
-
-## Current verification
-
-On 25.09.2026 the current sources were rebuilt with MSVC 19.50.35728 and
-`/std:c++latest`. The freshly produced `build/zenthrildb_tests.exe` completed
-with `All ZenthrilDB tests passed` and exit code 0. This confirms only existing
-test cases; it is not a performance, sanitizer or production-readiness result.
-
-## Corrected build defects
-
-The earlier current-source build failed because `WaiterEntry::cv` used the wrong
-condition-variable pointer type. The correction and verification are recorded in
-`CHANGELOG_DISSERTATION.md`.
+| Формат страниц | 8192 байта, little-endian, CRC32 | CRC обнаруживает часть повреждений, но не восстанавливает произвольный файл |
+| WAL | CRC/LSN, fail-closed на CRC, trim неполного EOF-tail, durable append API | Системный flush протестирован на двух ОС; аппаратный power-loss не проверен |
+| Transaction lifecycle | BEGIN/COMMIT/ROLLBACK sync до успешного возврата; in-doubt при sync failure; IDs из WAL | Гарантия lifecycle record, не атомарность произвольных page mutations |
+| Страницы | FileManager flush вызывает ОС sync; PageManager атомарно обновляет страницу, PageDirectory и free-list через общий coordinator | Необёрнутый `FileManager::writePage()` пишет без WAL и не даёт транзакционной гарантии |
+| Recovery | Автоматически вызывается из `FileManager::openDatabase()` после межпроцессного lock; PageImage и DatabaseHeaderImage REDO/UNDO | Гарантия применяется к мутациям через общий StorageMutationCoordinator; прямой low-level `FileManager::writePage()` не журналируется |
+| Crash-тесты | Отдельные процессы и повторное открытие, частичная запись WAL, прерывание восстановления и публикации снимка, инъекции write/sync/ENOSPC в тестовых конфигурациях | ENOSPC моделируется исключением. Проверка физического отказа остаётся отдельной. |
+| Межпроцессная блокировка | Windows `LockFileEx`, Linux `flock`, блокировка на срок жизни FileManager | Проверены сборкой и тестами на Windows и Ubuntu; внешние файловые системы отдельно не проверялись |
+| Storage consistency | Checker сверяет страницы/CRC/Page LSN, валидность WAL и транзакций, metadata/directory/free-list/root pages; `DatabaseRuntime` проверяет базу при старте | Низкоуровневые constructors остаются доступны для внутренних тестов; app API — DatabaseRuntime |
+| Снимок | Базовый образ, манифест, проверка страниц и публикация нового поколения. Восстановление применяет образы из WAL после границы | Полный WAL требуется для сверки префикса. Сокращение истории запланировано отдельно. |
+| Верхний слой | Record Manager и KV CLI. B+Tree, MVCC и SQL в дорожной карте | Каждая запись занимает одну страницу. Пользовательская транзакционная изоляция остаётся открытой. |
+| Zenthril IPC | Не реализовано | Спецификация есть, reliability gate остаётся открытым |

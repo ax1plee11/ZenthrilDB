@@ -10,25 +10,29 @@ TransactionLogAdapter::TransactionLogAdapter(LogManager& logManager) noexcept
   : logManager_(logManager) {}
 
 LogSequenceNumber TransactionLogAdapter::recordBegin(TransactionId id) {
-  return logManager_.append(LogRecordType::TransactionStarted,
-                            LogPayloadCodec::encodeTransaction(TransactionPayload{.transactionId = id}));
+  return logManager_.appendWithLsn(LogRecordType::TransactionStarted, [id](LogSequenceNumber) {
+    return LogPayloadCodec::encodeTransaction(TransactionPayload{.transactionId = id});
+  });
 }
 
 LogSequenceNumber TransactionLogAdapter::recordCommit(TransactionId id) {
-  const auto lsn = logManager_.append(
-    LogRecordType::TransactionCommitted,
-    LogPayloadCodec::encodeTransaction(TransactionPayload{.transactionId = id}));
   try {
-    logManager_.flush();
+    return logManager_.appendWithLsn(LogRecordType::TransactionCommitted, [id](LogSequenceNumber) {
+      return LogPayloadCodec::encodeTransaction(TransactionPayload{.transactionId = id});
+    });
   } catch (...) {
     std::throw_with_nested(CommitOutcomeUnknown{});
   }
-  return lsn;
 }
 
 LogSequenceNumber TransactionLogAdapter::recordRollback(TransactionId id) {
-  return logManager_.append(LogRecordType::TransactionRolledBack,
-                            LogPayloadCodec::encodeTransaction(TransactionPayload{.transactionId = id}));
+  try {
+    return logManager_.appendWithLsn(LogRecordType::TransactionRolledBack, [id](LogSequenceNumber) {
+      return LogPayloadCodec::encodeTransaction(TransactionPayload{.transactionId = id});
+    });
+  } catch (...) {
+    std::throw_with_nested(RollbackOutcomeUnknown{});
+  }
 }
 
 } // namespace zenthrildb

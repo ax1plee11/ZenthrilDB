@@ -1,13 +1,14 @@
 #include "core/PageManager.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <utility>
 
 namespace zenthrildb {
 
-PageManager::PageManager(FileManager& fileManager, FreePageManager& freePageManager)
-  : fileManager_(fileManager), freePageManager_(freePageManager) {}
+PageManager::PageManager(FileManager& fileManager, FreePageManager& freePageManager, MetadataManager& metadataManager)
+  : fileManager_(fileManager), freePageManager_(freePageManager), metadataManager_(metadataManager) {}
 
 Page PageManager::allocatePage(PageType type) {
   return allocatePage(type, {});
@@ -15,11 +16,19 @@ Page PageManager::allocatePage(PageType type) {
 
 Page PageManager::allocatePage(PageType type, std::string owner) {
   std::lock_guard lock(mutex_);
+  if (type != PageType::Table && type != PageType::Index && type != PageType::Overflow) {
+    throw std::invalid_argument("PageManager can allocate only user data page types");
+  }
+  const auto beforeHeader = fileManager_.header();
   Page page;
-  page.header().pageId = freePageManager_.allocatePage();
+  page.header().pageId = freePageManager_.allocatePageDeferred();
   page.header().pageType = type;
   page.header().usedBytes = 0;
-  pageDirectory_.registerPage(makeDirectoryEntry(page, std::move(owner), PageStatus::InUse));
+  const auto resultingPageCount = std::max<std::uint64_t>(beforeHeader.totalPages,
+    static_cast<std::uint64_t>(page.header().pageId) + 1);
+  metadataManager_.registerPage(makeDirectoryEntry(page, owner, PageStatus::InUse),
+    {page}, beforeHeader, resultingPageCount);
+  freePageManager_.completeDeferredAllocation(page.header().pageId);
   dirtyPages_.insert(page.header().pageId);
   return page;
 }
@@ -29,23 +38,85 @@ void PageManager::freePage(PageId pageId) {
   if (pageId < kFirstUserPageId) {
     throw std::runtime_error("Reserved pages cannot be freed");
   }
+  const auto* entry = metadataManager_.pageDirectory().get(pageId);
+  if (entry == nullptr || entry->status != PageStatus::InUse) {
+    throw std::invalid_argument("Only an allocated user page can be freed");
+  }
+  if (fileManager_.readPage(pageId).header().pageType == PageType::Free) {
+    throw std::invalid_argument("Page is already free");
+  }
   Page freePage;
   freePage.header().pageId = pageId;
   freePage.header().pageType = PageType::Free;
   freePage.header().usedBytes = 0;
-  fileManager_.writePage(freePage);
-  pageDirectory_.registerPage(makeDirectoryEntry(freePage, {}, PageStatus::Free));
+  freePageManager_.freePageDeferred(pageId);
+  metadataManager_.registerPage(makeDirectoryEntry(freePage, {}, PageStatus::Free), {freePage});
   dirtyPages_.erase(pageId);
-  freePageManager_.freePage(pageId);
+}
+
+void PageManager::allocatePageAndWrite(Page page, std::string owner, Page updatedPage,
+                                      const std::function<void(Page&, PageId)>& linkPage) {
+  std::lock_guard lock(mutex_);
+  const auto* entry = metadataManager_.pageDirectory().get(updatedPage.header().pageId);
+  if (entry == nullptr || entry->status != PageStatus::InUse || entry->pageType != updatedPage.header().pageType) {
+    throw std::invalid_argument("Page link must belong to an allocated page");
+  }
+
+  const auto beforeHeader = fileManager_.header();
+  const auto pageId = freePageManager_.allocatePageDeferred();
+  try {
+    page.header().pageId = pageId;
+    linkPage(updatedPage, pageId);
+    const auto resultingPageCount = std::max(beforeHeader.totalPages, std::uint64_t{pageId} + 1);
+    auto newEntry = makeDirectoryEntry(page, std::move(owner), PageStatus::InUse);
+    metadataManager_.registerPage(newEntry, {page, updatedPage}, beforeHeader, resultingPageCount);
+    freePageManager_.completeDeferredAllocation(pageId);
+  } catch (...) {
+    fileManager_.markFailed();
+    throw;
+  }
+}
+
+void PageManager::freePageAndWrite(PageId pageId, const Page& updatedPage) {
+  std::lock_guard lock(mutex_);
+  if (pageId < kFirstUserPageId || updatedPage.header().pageId == pageId) {
+    throw std::invalid_argument("Invalid page ids for atomic unlink/free mutation");
+  }
+  const auto* freeEntry = metadataManager_.pageDirectory().get(pageId);
+  const auto* updatedEntry = metadataManager_.pageDirectory().get(updatedPage.header().pageId);
+  if (freeEntry == nullptr || freeEntry->status != PageStatus::InUse ||
+      updatedEntry == nullptr || updatedEntry->status != PageStatus::InUse ||
+      updatedPage.header().pageType != updatedEntry->pageType) {
+    throw std::invalid_argument("Atomic unlink/free requires two allocated pages");
+  }
+  Page freePage;
+  freePage.header().pageId = pageId;
+  freePage.header().pageType = PageType::Free;
+  auto freeDirectoryEntry = makeDirectoryEntry(freePage, {}, PageStatus::Free);
+  auto updatedDirectoryEntry = *updatedEntry;
+  std::vector<Page> pages{updatedPage, freePage};
+  std::vector<PageDirectoryEntry> entries{std::move(freeDirectoryEntry), std::move(updatedDirectoryEntry)};
+  freePageManager_.checkFreeListCapacity(1);
+  try {
+    freePageManager_.freePageDeferred(pageId);
+    metadataManager_.registerPages(std::move(entries), std::move(pages));
+  } catch (...) {
+    fileManager_.markFailed();
+    throw;
+  }
+  dirtyPages_.erase(pageId);
+  dirtyPages_.insert(updatedPage.header().pageId);
 }
 
 Page PageManager::readPage(PageId pageId) {
   std::lock_guard lock(mutex_);
   auto page = fileManager_.readPage(pageId);
-  if (pageDirectory_.get(pageId) == nullptr) {
-    pageDirectory_.registerPage(makeDirectoryEntry(page, {}, PageStatus::InUse));
-  }
   return page;
+}
+
+std::uint64_t PageManager::databasePageCount() const {
+  std::lock_guard lock(mutex_);
+  return fileManager_.header().totalPages;
 }
 
 void PageManager::writePage(const Page& page) {
@@ -53,8 +124,17 @@ void PageManager::writePage(const Page& page) {
   if (page.header().pageId < kFirstUserPageId) {
     throw std::runtime_error("Reserved pages must be managed by their owning subsystem");
   }
-  fileManager_.writePage(page);
-  pageDirectory_.registerPage(makeDirectoryEntry(page, {}, PageStatus::InUse));
+  const auto* existing = metadataManager_.pageDirectory().get(page.header().pageId);
+  if (existing == nullptr || existing->status != PageStatus::InUse || page.header().pageType == PageType::Free ||
+      (page.header().pageType != PageType::Table && page.header().pageType != PageType::Index &&
+       page.header().pageType != PageType::Overflow)) {
+    throw std::invalid_argument("Page must be allocated and have a user data page type before writing");
+  }
+  const auto owner = existing->ownerTable;
+  const auto timestamp = existing->creationTimestampUnixNs;
+  auto entry = makeDirectoryEntry(page, owner, PageStatus::InUse);
+  entry.creationTimestampUnixNs = timestamp;
+  metadataManager_.registerPage(entry, {page});
   dirtyPages_.insert(page.header().pageId);
 }
 
@@ -81,7 +161,7 @@ bool PageManager::isDirty(PageId pageId) const {
 
 std::optional<PageDirectoryEntry> PageManager::pageInfo(PageId pageId) const {
   std::lock_guard lock(mutex_);
-  if (const auto* entry = pageDirectory_.get(pageId)) {
+  if (const auto* entry = metadataManager_.pageDirectory().get(pageId)) {
     return *entry;
   }
   return std::nullopt;
