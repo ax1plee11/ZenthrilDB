@@ -14,6 +14,7 @@ class BufferPageGuard;
 class BufferManager {
 public:
   explicit BufferManager(FileManager& fileManager, std::size_t capacityPages);
+  ~BufferManager();
 
   [[nodiscard]] Page& pin(PageId pageId);
   [[nodiscard]] BufferPageGuard pinGuard(PageId pageId);
@@ -32,6 +33,7 @@ private:
   void evictIfNeeded();
 
   FileManager& fileManager_;
+  std::shared_ptr<DatabaseFileLock> ownership_;
   std::size_t capacityPages_;
   mutable std::mutex mutex_;
   std::list<PageId> lru_;

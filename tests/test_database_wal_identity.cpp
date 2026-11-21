@@ -16,7 +16,7 @@ namespace {
 void createLegacy(const std::filesystem::path& path, bool insert) {
   FileManager files;
   files.createDatabase(path);
-  LogManager wal(databaseWalPath(path));
+  LogManager wal(databaseWalPath(path), files.ownership());
   TransactionManager transactions(wal);
   StorageMutationCoordinator mutation(files, wal, transactions);
   FreePageManager freePages(files, mutation);

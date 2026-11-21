@@ -9,7 +9,7 @@
 
 namespace zenthrildb {
 namespace {
-constexpr std::size_t kFaultPointCount = static_cast<std::size_t>(IoFaultPoint::SnapshotSyncParent) + 1;
+constexpr std::size_t kFaultPointCount = static_cast<std::size_t>(IoFaultPoint::DatabaseClose) + 1;
 std::mutex gMutex;
 std::array<std::size_t, kFaultPointCount> gCountdowns{};
 std::array<bool, kFaultPointCount> gCrash{};

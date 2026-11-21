@@ -3,6 +3,9 @@
 #include "core/CRCManager.hpp"
 #include "storage/BinaryIO.hpp"
 #include "wal/LogRecord.hpp"
+#include "wal/LogPayload.hpp"
+#include "storage/SafeFilePath.hpp"
+#include "storage/StorageLimits.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -16,7 +19,8 @@ constexpr auto kMaxPageCount = static_cast<std::uint64_t>(std::numeric_limits<Pa
 constexpr auto kMaxFileBytes = static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max());
 
 void validateManifest(const SnapshotManifest& manifest) {
-  if (manifest.pageCount < kFirstUserPageId || manifest.pageCount > kMaxPageCount) {
+  if (manifest.pageCount < kFirstUserPageId || manifest.pageCount > kMaxPageCount ||
+      manifest.pageCount > kMaxDatabasePages) {
     throw std::runtime_error("Snapshot manifest page count is out of bounds");
   }
   const auto expectedSize = DatabaseHeader::serializedSize() + manifest.pageCount * kDefaultPageSize;
@@ -29,7 +33,11 @@ void validateManifest(const SnapshotManifest& manifest) {
   if (manifest.transactionHighWater == std::numeric_limits<std::uint64_t>::max()) {
     throw std::runtime_error("Snapshot manifest transaction ID high-water is invalid");
   }
-  if (manifest.identity.snapshotLsn == 0) {
+  if (manifest.identity.reducedHistory) {
+    if (manifest.walPrefixBytes != WalIdentity::kSize + LogRecord::kHeaderSize + LogPayloadCodec::kSafeCheckpointPayloadSize) {
+      throw std::runtime_error("Reduced WAL manifest must cover exactly its boundary record");
+    }
+  } else if (manifest.identity.snapshotLsn == 0) {
     if (manifest.walPrefixBytes != WalIdentity::kSize || manifest.transactionHighWater != 0) {
       throw std::runtime_error("Snapshot manifest has a nonempty history at LSN zero");
     }
@@ -119,6 +127,7 @@ std::filesystem::path snapshotBaselinePath(const std::filesystem::path& database
 }
 
 SnapshotManifest readSnapshotManifest(const std::filesystem::path& path) {
+  detail::validateStoragePath(path);
   if (!std::filesystem::is_regular_file(path)) {
     throw std::runtime_error("Snapshot manifest is missing or is not a regular file");
   }
@@ -137,6 +146,8 @@ SnapshotManifest readSnapshotManifest(const std::filesystem::path& path) {
 
 void writeSnapshotManifest(const std::filesystem::path& path, const SnapshotManifest& manifest) {
   const auto bytes = manifest.serialize();
+  detail::validateStoragePath(path, true);
+  if (!std::filesystem::exists(path)) detail::createStorageFileExclusive(path);
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
   if (!output) throw std::runtime_error("Failed to open snapshot manifest for writing");
   output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
@@ -146,6 +157,7 @@ void writeSnapshotManifest(const std::filesystem::path& path, const SnapshotMani
 }
 
 std::uint32_t snapshotFileCrc(const std::filesystem::path& path, std::uint64_t bytes) {
+  detail::validateStoragePath(path);
   if (bytes > kMaxFileBytes) throw std::runtime_error("Snapshot checksum byte count is out of bounds");
   if (!std::filesystem::is_regular_file(path)) {
     throw std::runtime_error("Snapshot checksum file is missing or is not a regular file");

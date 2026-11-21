@@ -4,6 +4,7 @@
 #include "storage/Page.hpp"
 #include "storage/WalIdentity.hpp"
 #include "core/DatabaseFileLock.hpp"
+#include "storage/WalInstallation.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -12,6 +13,7 @@
 #include <string>
 #include <stdexcept>
 #include <memory>
+#include <atomic>
 
 namespace zenthrildb {
 
@@ -33,6 +35,14 @@ public:
   void createDatabase(const std::filesystem::path& path, bool bindWal);
   void openDatabase(const std::filesystem::path& path);
   void closeDatabase();
+  // A dependent handle pins OS ownership. Explicit close refuses while it exists.
+  [[nodiscard]] std::shared_ptr<DatabaseFileLock> ownership() const {
+    std::lock_guard lock(mutex_);
+    ensureOpen();
+    if (readOnly_ || !processLock_) throw std::logic_error("No writable database ownership");
+    return processLock_;
+  }
+  [[nodiscard]] DatabaseFileLock::Operation operation() const { return DatabaseFileLock::Operation(ownership()); }
 
   [[nodiscard]] Page readPage(PageId pageId);
   void writePage(const Page& page);
@@ -46,19 +56,21 @@ public:
   [[nodiscard]] const DatabaseHeader& header() const noexcept { return header_; }
   [[nodiscard]] const std::optional<WalIdentity>& walIdentity() const noexcept { return walIdentity_; }
   [[nodiscard]] std::optional<std::uint64_t> recoverySnapshotBoundary() const noexcept { return recoverySnapshotBoundary_; }
-  [[nodiscard]] bool isOpen() const noexcept { return fileStream_.is_open(); }
+  [[nodiscard]] bool isOpen() const { std::lock_guard lock(mutex_); return fileStream_.is_open(); }
 
 private:
   friend class RecoveryCoordinator;
   friend class SnapshotBaseline;
   friend class DatabaseRuntime;
   void openReadOnly(const std::filesystem::path& path);
+  [[nodiscard]] static std::optional<WalInstallation> resolveInstallation(const std::filesystem::path& path);
   struct PhysicalLayout {
     std::uint64_t completePages;
     bool hasPartialPage;
   };
   [[nodiscard]] PhysicalLayout physicalLayout() const;
   void ensureOpen() const;
+  [[nodiscard]] std::optional<DatabaseFileLock::Operation> accessOperation() const;
   void writeHeader();
   void readHeader();
   void readIdentity();
@@ -67,11 +79,12 @@ private:
   mutable std::recursive_mutex mutex_;
   std::fstream fileStream_;
   std::filesystem::path path_;
-  std::unique_ptr<DatabaseFileLock> processLock_;
+  std::shared_ptr<DatabaseFileLock> processLock_;
+  std::shared_ptr<DatabaseFileLock> installationLock_;
   DatabaseHeader header_{};
   std::optional<WalIdentity> walIdentity_;
   std::optional<std::uint64_t> recoverySnapshotBoundary_;
-  bool failed_{false};
+  std::atomic<bool> failed_{false};
   bool readOnly_{false};
 };
 

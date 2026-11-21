@@ -17,7 +17,7 @@ void test_free_page_manager() {
 
   FileManager fm;
   fm.createDatabase(path);
-  LogManager wal(databaseWalPath(path));
+  LogManager wal(databaseWalPath(path), fm.ownership());
   TransactionManager transactions(wal);
   StorageMutationCoordinator coordinator(fm, wal, transactions);
   FreePageManager freePages(fm, coordinator);
@@ -32,6 +32,7 @@ void test_free_page_manager() {
   const auto reused = reopened.allocatePage();
   assert(reused == freshPage);
 
+  wal.close();
   fm.closeDatabase();
   removeTestDatabaseArtifacts(path);
 }

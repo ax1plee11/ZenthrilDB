@@ -6,6 +6,8 @@
 #include "storage/DatabaseWalPath.hpp"
 #include "storage/IoFaultInjector.hpp"
 #include "storage/SnapshotManifest.hpp"
+#include "storage/SafeFilePath.hpp"
+#include "storage/StorageLimits.hpp"
 #include "wal/LogManager.hpp"
 
 #include <algorithm>
@@ -27,16 +29,7 @@ namespace zenthrildb {
 
 namespace {
 void createDatabaseFileExclusive(const std::filesystem::path& path) {
-#ifdef _WIN32
-  const auto handle = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                                  FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (handle == INVALID_HANDLE_VALUE) throw std::runtime_error("Database already exists or cannot be created");
-  if (!CloseHandle(handle)) throw std::runtime_error("Failed to close newly created database file");
-#else
-  const auto descriptor = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
-  if (descriptor < 0) throw std::runtime_error("Database already exists or cannot be created");
-  if (::close(descriptor) != 0) throw std::runtime_error("Failed to close newly created database file");
-#endif
+  detail::createStorageFileExclusive(path);
 }
 
 DatabaseHeader createNewDatabaseHeader() {
@@ -54,7 +47,13 @@ DatabaseHeader createNewDatabaseHeader() {
 } // namespace
 
 FileManager::~FileManager() {
-  try { closeDatabase(); } catch (...) { }
+  try { closeDatabase(); }
+  catch (...) {
+    std::fputs("ZenthrilDB: database close failed; dependent handles are revoked\n", stderr);
+    if (processLock_) processLock_->invalidate();
+    if (installationLock_) installationLock_->invalidate();
+    fileStream_.close();
+  }
 }
 
 void FileManager::createDatabase(const std::filesystem::path& path) {
@@ -64,7 +63,10 @@ void FileManager::createDatabase(const std::filesystem::path& path) {
 void FileManager::createDatabase(const std::filesystem::path& path, bool bindWal) {
   std::lock_guard lock(mutex_);
   if (fileStream_.is_open() || processLock_) closeDatabase();
-  auto processLock = std::make_unique<DatabaseFileLock>(path);
+  auto processLock = std::make_shared<DatabaseFileLock>(path);
+  if (std::filesystem::exists(std::filesystem::symlink_status(walInstallationPath(path)))) {
+    throw std::runtime_error("Cannot create over an installed database selector");
+  }
   if (std::filesystem::exists(path)) throw std::runtime_error("Refusing to overwrite an existing database file");
   if (std::filesystem::exists(databaseWalPath(path))) {
     throw std::runtime_error("Refusing to reuse an existing WAL for a new database");
@@ -82,6 +84,7 @@ void FileManager::createDatabase(const std::filesystem::path& path, bool bindWal
   if (!fileStream_) {
     throw std::runtime_error("Failed to create database file");
   }
+  processLock_ = processLock;
 
   writeHeader();
 
@@ -128,38 +131,75 @@ void FileManager::createDatabase(const std::filesystem::path& path, bool bindWal
 void FileManager::openDatabase(const std::filesystem::path& path) {
   std::lock_guard lock(mutex_);
   if (fileStream_.is_open() || processLock_) closeDatabase();
-  auto processLock = std::make_unique<DatabaseFileLock>(path);
-  path_ = path;
+  auto processLock = std::make_shared<DatabaseFileLock>(path);
+  const auto installation = resolveInstallation(path);
+  std::shared_ptr<DatabaseFileLock> logicalLock;
+  path_ = installation ? installation->targetPath : path;
+  if (installation) {
+    logicalLock = std::move(processLock);
+    processLock = std::make_shared<DatabaseFileLock>(path_);
+  }
   walIdentity_.reset();
   if (!std::filesystem::is_regular_file(path_)) throw std::runtime_error("Database is missing or is not a regular file");
   fileStream_.open(path_, std::ios::binary | std::ios::in | std::ios::out);
   if (!fileStream_) {
     throw std::runtime_error("Failed to open database file");
   }
+  processLock_ = processLock;
   try {
     readHeader();
     readIdentity();
+    if (installation && walIdentity_ != std::optional{installation->target}) {
+      throw std::runtime_error("Installed database identity disagrees with selector");
+    }
     const auto walPath = databaseWalPath(path_);
     if (!std::filesystem::exists(walPath)) {
       throw std::runtime_error("Database WAL is missing; refusing to expose database");
     }
-    LogManager wal(walPath, header_, walIdentity_);
+    LogManager wal(walPath, header_, walIdentity_, false, processLock_);
     RecoveryCoordinator coordinator;
     (void)coordinator.recover(wal, *this);
     verifyPhysicalLayout();
     processLock_ = std::move(processLock);
+    installationLock_ = std::move(logicalLock);
     failed_ = false;
   } catch (...) {
     fileStream_.close();
     header_ = {};
     walIdentity_.reset();
     recoverySnapshotBoundary_.reset();
+    processLock_.reset();
     throw;
   }
 }
 
+std::optional<WalInstallation> FileManager::resolveInstallation(const std::filesystem::path& path) {
+  if (!std::filesystem::exists(std::filesystem::symlink_status(walInstallationPath(path)))) return {};
+  const auto state = readWalInstallation(path);
+  if (state.targetPath == std::filesystem::absolute(path).lexically_normal() ||
+      state.targetPath.filename() != path.filename() ||
+      std::filesystem::exists(std::filesystem::symlink_status(walInstallationPath(state.targetPath)))) {
+    throw std::runtime_error("Chained or conflicting installation selector");
+  }
+  FileManager source;
+  source.openReadOnly(path);
+  if (source.walIdentity() != std::optional{state.source} ||
+      std::filesystem::file_size(path) != state.sourceDataBytes ||
+      !std::filesystem::is_regular_file(databaseWalPath(path)) ||
+      std::filesystem::file_size(databaseWalPath(path)) != state.sourceWalBytes) {
+    throw std::runtime_error("Preserved installation source is missing or changed");
+  }
+  if (state.sourceHasBaseline && (!std::filesystem::is_regular_file(snapshotBaselinePath(path)) ||
+                                 !std::filesystem::is_regular_file(snapshotManifestPath(path)))) {
+    throw std::runtime_error("Preserved installation source sidecars are missing");
+  }
+  return state;
+}
+
 void FileManager::openReadOnly(const std::filesystem::path& path) {
   std::lock_guard lock(mutex_);
+  detail::validateStoragePath(path);
+  checkStorageSize(path, kMaxDatabaseBytes);
   if (fileStream_.is_open()) throw std::logic_error("An open file manager cannot become read-only");
   if (!std::filesystem::is_regular_file(path)) throw std::runtime_error("Snapshot data file is missing");
   path_ = path;
@@ -172,15 +212,26 @@ void FileManager::openReadOnly(const std::filesystem::path& path) {
 
 void FileManager::closeDatabase() {
   std::lock_guard lock(mutex_);
+  if (processLock_ && processLock_.use_count() != 1) {
+    throw std::logic_error("Close requires WAL and buffer handles to be closed first");
+  }
   std::exception_ptr failure;
   if (fileStream_.is_open()) {
     if (!readOnly_) {
       try { flush(); } catch (...) { failure = std::current_exception(); }
     }
+    try { IoFaultInjector::failIfArmed(IoFaultPoint::DatabaseClose); }
+    catch (...) { if (!failure) failure = std::current_exception(); }
     fileStream_.close();
     if (!failure && fileStream_.fail()) failure = std::make_exception_ptr(std::runtime_error("Failed to close database file"));
   }
-  processLock_.reset();
+  for (auto* owner : {&processLock_, &installationLock_}) {
+    if (*owner) {
+      try { (*owner)->release(); }
+      catch (...) { if (!failure) failure = std::current_exception(); }
+      owner->reset();
+    }
+  }
   walIdentity_.reset();
   recoverySnapshotBoundary_.reset();
   failed_ = false;
@@ -189,6 +240,7 @@ void FileManager::closeDatabase() {
 }
 
 Page FileManager::readPage(PageId pageId) {
+  auto operation = accessOperation();
   std::lock_guard lock(mutex_);
   ensureOpen();
   const auto fileSize = std::filesystem::file_size(path_);
@@ -213,9 +265,11 @@ Page FileManager::readPage(PageId pageId) {
 }
 
 void FileManager::writePage(const Page& page) {
+  auto operation = accessOperation();
   std::lock_guard lock(mutex_);
   ensureOpen();
   if (readOnly_) throw std::logic_error("Cannot write a read-only database");
+  if (page.header().pageId >= kMaxDatabasePages) throw std::length_error("Database page limit reached");
   if (walIdentity_ && page.header().pageId == kHeaderMirrorPageId) {
     throw std::invalid_argument("The database identity page is immutable");
   }
@@ -240,9 +294,11 @@ void FileManager::writePage(const Page& page) {
 }
 
 PageId FileManager::reservePageId() {
+  auto operation = accessOperation();
   std::lock_guard lock(mutex_);
   ensureOpen();
   if (readOnly_) throw std::logic_error("Cannot reserve a page in a read-only database");
+  if (header_.totalPages >= kMaxDatabasePages) throw std::length_error("Database page limit reached");
   if (header_.totalPages > static_cast<std::uint64_t>(std::numeric_limits<PageId>::max())) {
     throw std::overflow_error("Page identifier space exhausted");
   }
@@ -261,6 +317,7 @@ std::uint64_t FileManager::physicalPageCount() const {
 }
 
 FileManager::PhysicalLayout FileManager::physicalLayout() const {
+  auto operation = accessOperation();
   std::lock_guard lock(mutex_);
   ensureOpen();
   const auto size = std::filesystem::file_size(path_);
@@ -275,6 +332,7 @@ FileManager::PhysicalLayout FileManager::physicalLayout() const {
 }
 
 void FileManager::verifyPhysicalLayout() const {
+  auto operation = accessOperation();
   std::lock_guard lock(mutex_);
   ensureOpen();
   if (physicalPageCount() != header_.totalPages) {
@@ -284,6 +342,7 @@ void FileManager::verifyPhysicalLayout() const {
 
 void FileManager::restoreHeaderImage(
     const std::array<Byte, DatabaseHeader::serializedSize()>& image, bool truncateTail) {
+  auto operation = accessOperation();
   std::lock_guard lock(mutex_);
   ensureOpen();
   if (readOnly_) throw std::logic_error("Cannot restore a read-only database header");
@@ -295,6 +354,7 @@ void FileManager::restoreHeaderImage(
   if (restored.magic != kDatabaseMagic || restored.version != kCurrentDatabaseVersion ||
       restored.pageSize != kDefaultPageSize ||
       restored.totalPages < kFirstUserPageId ||
+      restored.totalPages > kMaxDatabasePages ||
       restored.totalPages > static_cast<std::uint64_t>(std::numeric_limits<PageId>::max()) + 1 ||
       CRCManager::compute(checksumBytes) != expectedChecksum) {
     throw std::runtime_error("Recovery refused an invalid database header image");
@@ -324,6 +384,7 @@ void FileManager::restoreHeaderImage(
 }
 
 void FileManager::flush() {
+  auto operation = accessOperation();
   std::lock_guard lock(mutex_);
   ensureOpen();
   if (readOnly_) throw std::logic_error("Cannot synchronize a read-only database");
@@ -333,6 +394,18 @@ void FileManager::flush() {
   }
   IoFaultInjector::failIfArmed(IoFaultPoint::PageSync);
   detail::syncFileToStorage(path_);
+}
+
+std::optional<DatabaseFileLock::Operation> FileManager::accessOperation() const {
+  std::shared_ptr<DatabaseFileLock> owner;
+  {
+    std::lock_guard lock(mutex_);
+    ensureOpen();
+    if (readOnly_) return {};
+    owner = processLock_;
+  }
+  if (!owner) throw std::logic_error("Database operation has no ownership");
+  return DatabaseFileLock::Operation(std::move(owner));
 }
 
 void FileManager::ensureOpen() const {
@@ -374,6 +447,7 @@ void FileManager::readHeader() {
   }
   if (header_.magic != kDatabaseMagic || header_.version != kCurrentDatabaseVersion ||
       header_.pageSize != kDefaultPageSize || header_.totalPages < kFirstUserPageId ||
+      header_.totalPages > kMaxDatabasePages ||
       header_.totalPages > static_cast<std::uint64_t>(std::numeric_limits<PageId>::max()) + 1) {
     throw std::runtime_error("Unsupported or invalid database header");
   }

@@ -21,9 +21,11 @@ struct SafeCheckpointPayload;
 class LogManager final : public RecoveryManager, public CheckpointManager {
 public:
   explicit LogManager(std::filesystem::path walPath);
+  LogManager(std::filesystem::path walPath, std::shared_ptr<DatabaseFileLock> ownership);
   LogManager(std::filesystem::path walPath, const std::array<Byte, DatabaseHeader::kUuidSize>& databaseUuid);
   LogManager(std::filesystem::path walPath, const DatabaseHeader& header, std::optional<WalIdentity> identity,
-             bool readOnly = false);
+             bool readOnly = false, std::shared_ptr<DatabaseFileLock> ownership = {});
+  void close() { std::lock_guard lock(mutex_); wal_.close(); poisoned_ = true; }
 
   [[nodiscard]] LogSequenceNumber append(LogRecordType type, std::span<const Byte> payload = {});
 

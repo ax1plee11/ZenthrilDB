@@ -1,4 +1,5 @@
 #include "core/DatabaseRuntime.hpp"
+#include "core/CRCManager.hpp"
 #include "storage/BinaryFormat.hpp"
 #include "storage/BinaryIO.hpp"
 #include "storage/SnapshotManifest.hpp"
@@ -73,7 +74,7 @@ void assertSnapshotRejected(const std::filesystem::path& path, Operation&& opera
 void stagePageMutation(const std::filesystem::path& path, PageId id, Byte value, bool commit) {
   FileManager files;
   files.openDatabase(path);
-  LogManager log(databaseWalPath(path), files.header(), files.walIdentity());
+  LogManager log(databaseWalPath(path), files.header(), files.walIdentity(), false, files.ownership());
   TransactionManager transactions(log);
   const auto tx = transactions.begin();
   const auto before = files.readPage(id);
@@ -188,6 +189,45 @@ void checkInvalidBaselineStructure(const std::filesystem::path& snapshot, const 
   writeSnapshotManifest(manifestPath, manifest);
   assertSnapshotRejected(copy, [&] { (void)DatabaseRuntime::verifySnapshot(copy, true); });
   assertSnapshotRejected(copy, [&] { DatabaseRuntime database(copy); });
+  removeSnapshotFixture(copy);
+}
+
+void checkInvalidPostBoundaryStructure(const std::filesystem::path& snapshot,
+                                       const std::filesystem::path& copy,
+                                       PageId pageId, std::size_t fieldOffset, PageId replacement) {
+  copySnapshot(snapshot, copy);
+  const auto baseline = DatabaseRuntime::verifySnapshot(copy, true);
+  {
+    FileManager files;
+    files.openDatabase(copy);
+    LogManager log(databaseWalPath(copy), files.header(), files.walIdentity(), false, files.ownership());
+    TransactionManager transactions(log);
+    const auto tx = transactions.begin();
+    const auto before = files.readPage(pageId);
+    auto after = before;
+    binary::writeLittleEndian(after.payload(), fieldOffset, replacement);
+    const auto assigned = log.appendWithLsn(LogRecordType::PageImageWritten, [&](LogSequenceNumber lsn) {
+      after.setPageLsn(lsn.value());
+      return LogPayloadCodec::encodePageImageWritten(PageImageWrittenPayload{
+        .transactionId = tx.id(),
+        .pageId = pageId,
+        .previousTxLsn = 0,
+        .pageFormatVersion = Page::kFormatVersionV2,
+        .beforeImage = before.serialize(),
+        .afterImage = after.serialize(),
+      });
+    });
+    assert(assigned.value() > baseline.identity.snapshotLsn);
+    transactions.commit(tx.id());
+    files.writePage(after);
+    files.flush();
+  }
+  // The baseline is valid and the working page matches the committed WAL image,
+  // including its CRC and LSN. Only post-replay structural validation rejects it.
+  const auto beforeVerification = snapshotBytes(copy);
+  assert(DatabaseRuntime::verifySnapshot(copy, true) == baseline);
+  assert(snapshotBytes(copy) == beforeVerification);
+  assertSnapshotRejected(copy, [&] { (void)DatabaseRuntime::verifySnapshot(copy); });
   removeSnapshotFixture(copy);
 }
 
@@ -379,6 +419,84 @@ void checkBaselineWithoutHistoricalImages(const std::filesystem::path& snapshot,
   removeSnapshotFixture(working);
 }
 
+void checkRequiredBaseline(const std::filesystem::path& source, const std::filesystem::path& directory) {
+  const auto published = directory / "required";
+  const auto database = published / source.filename();
+  const auto originalData = readSnapshotFixture(source);
+  const auto originalWal = readSnapshotFixture(databaseWalPath(source));
+  DatabaseRuntime::snapshotTo(source, published, true);
+  const auto manifest = DatabaseRuntime::verifySnapshot(database);
+  assert(manifest.identity.baselineRequired);
+  assert(WalIdentity::deserialize(manifest.identity.serialize()) == manifest.identity);
+  for (const auto flag : {0u, 2u}) {
+    auto encoded = manifest.identity.serialize();
+    std::size_t flagOffset = 28;
+    binary::writeLittleEndian(encoded, flagOffset, flag);
+    std::size_t checksumOffset = WalIdentity::kSize - sizeof(std::uint32_t);
+    const auto checksum = CRCManager::compute(std::span<const Byte>(encoded).first(checksumOffset));
+    binary::writeLittleEndian(encoded, checksumOffset, checksum);
+    bool rejected = false;
+    try { (void)WalIdentity::deserialize(encoded); }
+    catch (const std::exception&) { rejected = true; }
+    assert(rejected);
+  }
+  assert(readSnapshotFixture(source) == originalData);
+  assert(readSnapshotFixture(databaseWalPath(source)) == originalWal);
+
+  const auto backup = directory / "required-backup";
+  {
+    DatabaseRuntime runtime(database);
+    runtime.records().put("records", "post-boundary", kCommitted);
+    (void)runtime.checkpoint();
+    runtime.backupTo(backup);
+  }
+  const auto backedUp = backup / source.filename();
+  assert(DatabaseRuntime::verifySnapshot(backedUp).identity.baselineRequired);
+  assert(snapshotBytes(backedUp) == snapshotBytes(database));
+  {
+    DatabaseRuntime runtime(backedUp);
+    assert(runtime.records().get("records", "post-boundary") == kCommitted);
+  }
+
+  for (int missing = 1; missing <= 3; ++missing) {
+    const auto copy = directory / ("missing-required-" + std::to_string(missing) + ".zdb");
+    copySnapshot(database, copy);
+    if (missing & 1) std::filesystem::remove(snapshotBaselinePath(copy));
+    if (missing & 2) std::filesystem::remove(snapshotManifestPath(copy));
+    if (missing == 3) {
+      std::ofstream wal(databaseWalPath(copy), std::ios::binary | std::ios::app);
+      wal.write("bad", 3);
+      wal.close();
+      assert(wal);
+    }
+    const auto data = readSnapshotFixture(copy);
+    const auto wal = readSnapshotFixture(databaseWalPath(copy));
+    for (int reopen = 0; reopen < 2; ++reopen) {
+      bool rejected = false;
+      try { DatabaseRuntime runtime(copy); }
+      catch (const std::exception&) { rejected = true; }
+      assert(rejected);
+      assert(readSnapshotFixture(copy) == data);
+      assert(readSnapshotFixture(databaseWalPath(copy)) == wal);
+    }
+    removeSnapshotFixture(copy);
+  }
+
+  const auto childDirectory = directory / "required-child";
+  DatabaseRuntime::snapshotTo(database, childDirectory);
+  const auto child = childDirectory / source.filename();
+  const auto childManifest = DatabaseRuntime::verifySnapshot(child);
+  assert(childManifest.identity.baselineRequired);
+  assert(childManifest.identity.databaseUuid == manifest.identity.databaseUuid);
+  assert(childManifest.identity.generation != manifest.identity.generation);
+  {
+    DatabaseRuntime runtime(child);
+    assert(runtime.records().get("records", "post-boundary") == kCommitted);
+  }
+  for (const auto& file : {child, backedUp, database}) removeSnapshotFixture(file);
+  for (const auto& folder : {childDirectory, backup, published}) std::filesystem::remove(folder);
+}
+
 } // namespace
 
 void test_snapshot_foundation() {
@@ -456,9 +574,14 @@ void test_snapshot_foundation() {
                                  format::kPageDirectoryEntriesOffset, PageId{0});
   checkInvalidBaselineStructure(snapshot, directory / "bad-free-list.zdb", kFreePageListPageId,
                                  format::kFreePageListEntriesOffset, untouched);
+  checkInvalidPostBoundaryStructure(snapshot, directory / "bad-live-catalog.zdb", kPageDirectoryPageId,
+                                    format::kPageDirectoryEntriesOffset, PageId{0});
+  checkInvalidPostBoundaryStructure(snapshot, directory / "bad-live-free-list.zdb", kFreePageListPageId,
+                                    format::kFreePageListEntriesOffset, untouched);
   checkPostBoundaryGrowth(snapshot, directory);
   checkIncompleteSidecars(snapshot, directory);
   checkBaselineWithoutHistoricalImages(snapshot, directory);
+  checkRequiredBaseline(source, directory);
 
   assert(snapshotBytes(snapshot) == snapshotBefore);
   assert(readSnapshotFixture(source) == sourceData);

@@ -5,9 +5,11 @@
 #include "storage/DatabaseWalPath.hpp"
 #include "storage/DurableFileSync.hpp"
 #include "storage/IoFaultInjector.hpp"
+#include "storage/SafeFilePath.hpp"
 #include "wal/LogPayload.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 
 #ifndef _WIN32
@@ -21,6 +23,7 @@ namespace zenthrildb {
 namespace {
 
 void createPrivateDirectory(const std::filesystem::path& directory) {
+  detail::validateStoragePath(directory, true, true);
 #ifdef _WIN32
   if (!std::filesystem::create_directory(directory)) {
     throw std::invalid_argument("Destination directory already exists");
@@ -82,8 +85,9 @@ DatabaseRuntime::DatabaseRuntime(const std::filesystem::path& path, bool create)
   : path_(std::filesystem::absolute(path)) {
   if (create) files_.createDatabase(path_, true);
   else files_.openDatabase(path_);
+  path_ = files_.path_; // All managers must use the selected physical generation.
 
-  wal_ = std::make_unique<LogManager>(databaseWalPath(path_), files_.header(), files_.walIdentity());
+  wal_ = std::make_unique<LogManager>(databaseWalPath(path_), files_.header(), files_.walIdentity(), false, files_.ownership());
   transactions_ = std::make_unique<TransactionManager>(*wal_);
   mutations_ = std::make_unique<StorageMutationCoordinator>(files_, *wal_, *transactions_);
   freePages_ = std::make_unique<FreePageManager>(files_, *mutations_);
@@ -122,10 +126,12 @@ void DatabaseRuntime::backupTo(const std::filesystem::path& destinationDirectory
   wal_->flush();
   files_.flush();
 
-  auto destination = std::filesystem::absolute(destinationDirectory).lexically_normal();
+  auto destination = std::filesystem::absolute(destinationDirectory);
   if (!destination.has_filename() && destination.has_relative_path()) {
     destination = destination.parent_path();
   }
+  detail::validateStoragePath(destination.parent_path(), false, true);
+  destination = destination.lexically_normal();
   if (std::filesystem::exists(destination)) throw std::invalid_argument("Destination directory already exists");
 
   const auto stagingToken = WalIdentity::newGeneration();
@@ -143,6 +149,7 @@ void DatabaseRuntime::backupTo(const std::filesystem::path& destinationDirectory
   const auto manifestCopy = snapshotManifestPath(databaseCopy);
   auto lockCopy = databaseCopy;
   lockCopy += ".lock";
+  auto walLockCopy = walCopy; walLockCopy += ".lock";
   const bool hasBaseline = SnapshotBaseline::existsFor(path_);
   createPrivateDirectory(staging);
 
@@ -167,7 +174,7 @@ void DatabaseRuntime::backupTo(const std::filesystem::path& destinationDirectory
   } catch (...) {
     if (!published) {
       std::error_code ignored;
-      for (const auto& path : {lockCopy, manifestCopy, baselineCopy, databaseCopy, walCopy, staging}) {
+      for (const auto& path : {walLockCopy, lockCopy, manifestCopy, baselineCopy, databaseCopy, walCopy, staging}) {
         std::filesystem::remove(path, ignored);
       }
     }
@@ -176,13 +183,30 @@ void DatabaseRuntime::backupTo(const std::filesystem::path& destinationDirectory
 }
 
 void DatabaseRuntime::snapshotTo(const std::filesystem::path& sourcePath,
+                                 const std::filesystem::path& destinationDirectory, bool requireBaseline) {
+  createSnapshot(sourcePath, destinationDirectory, requireBaseline, false);
+}
+
+void DatabaseRuntime::reduceWalTo(const std::filesystem::path& source,
                                  const std::filesystem::path& destinationDirectory) {
-  const auto source = std::filesystem::absolute(sourcePath);
-  auto destination = std::filesystem::absolute(destinationDirectory).lexically_normal();
+  createSnapshot(source, destinationDirectory, true, true);
+}
+
+void DatabaseRuntime::createSnapshot(const std::filesystem::path& sourcePath,
+                                     const std::filesystem::path& destinationDirectory,
+                                     bool requireBaseline, bool reduceHistory) {
+  const auto logicalSource = std::filesystem::absolute(sourcePath);
+  DatabaseFileLock logicalLock(logicalSource);
+  const auto installation = FileManager::resolveInstallation(logicalSource);
+  const auto source = installation ? installation->targetPath : logicalSource;
+  std::unique_ptr<DatabaseFileLock> selectedLock;
+  if (installation) selectedLock = std::make_unique<DatabaseFileLock>(source);
+  auto destination = std::filesystem::absolute(destinationDirectory);
   if (!destination.has_filename() && destination.has_relative_path()) destination = destination.parent_path();
+  detail::validateStoragePath(destination.parent_path(), false, true);
+  destination = destination.lexically_normal();
   if (source.extension() != ".zdb") throw std::invalid_argument("Snapshot source must end in .zdb");
   const auto sourceWal = databaseWalPath(source);
-  DatabaseFileLock sourceLock(source);
   if (!std::filesystem::is_regular_file(source) || !std::filesystem::is_regular_file(sourceWal)) {
     throw std::invalid_argument("Snapshot requires an existing database and its WAL");
   }
@@ -204,6 +228,7 @@ void DatabaseRuntime::snapshotTo(const std::filesystem::path& sourcePath,
   const auto manifestPath = snapshotManifestPath(stagedData);
   auto stagedLock = stagedData;
   stagedLock += ".lock";
+  auto stagedWalLock = stagedWal; stagedWalLock += ".lock";
   IoFaultInjector::failIfArmed(IoFaultPoint::SnapshotCreateDirectory);
   createPrivateDirectory(staging);
   try {
@@ -220,11 +245,25 @@ void DatabaseRuntime::snapshotTo(const std::filesystem::path& sourcePath,
     SnapshotManifest manifest;
     {
       DatabaseRuntime verified(stagedData);
+      if (installation && verified.files_.walIdentity() != std::optional{installation->target}) {
+        throw std::runtime_error("Selected snapshot source identity mismatch");
+      }
       const auto records = verified.wal_->replay();
       const auto boundary = records.empty() ? 0 : records.back().lsn().value();
       manifest.identity = WalIdentity::fresh(verified.files_.header(), boundary);
+      manifest.identity.baselineRequired = requireBaseline ||
+        (verified.files_.walIdentity() && verified.files_.walIdentity()->baselineRequired);
+      manifest.identity.reducedHistory = reduceHistory ||
+        (verified.files_.walIdentity() && verified.files_.walIdentity()->reducedHistory);
+      if (manifest.identity.reducedHistory && boundary >= std::numeric_limits<std::uint64_t>::max() - 1) {
+        throw std::overflow_error("No LSN remains for the reduced WAL boundary");
+      }
       manifest.pageCount = verified.files_.header().totalPages;
       for (const auto& record : records) {
+        if (record.type() == LogRecordType::SafeCheckpoint) {
+          manifest.transactionHighWater = std::max(manifest.transactionHighWater,
+            LogPayloadCodec::decodeSafeCheckpoint(record.payload()).transactionHighWater);
+        }
         if (record.type() == LogRecordType::TransactionStarted) {
           manifest.transactionHighWater = std::max(manifest.transactionHighWater,
             LogPayloadCodec::decodeTransaction(record.payload()).transactionId.value());
@@ -234,6 +273,7 @@ void DatabaseRuntime::snapshotTo(const std::filesystem::path& sourcePath,
         throw std::runtime_error("Snapshot generation was reused");
       }
     }
+    if (manifest.identity.reducedHistory) IoFaultInjector::failIfArmed(IoFaultPoint::ReductionBoundary);
     std::filesystem::remove(baselinePath);
     std::filesystem::remove(manifestPath);
     {
@@ -246,13 +286,34 @@ void DatabaseRuntime::snapshotTo(const std::filesystem::path& sourcePath,
       const auto bytes = manifest.identity.serialize();
       IoFaultInjector::failIfArmed(IoFaultPoint::SnapshotWriteFile);
       output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-      std::array<char, 64 * 1024> buffer{};
-      while (oldWal.read(buffer.data(), buffer.size()) || oldWal.gcount() != 0) {
-        output.write(buffer.data(), oldWal.gcount());
+      if (manifest.identity.reducedHistory) {
+        const auto payload = LogPayloadCodec::encodeSafeCheckpoint(SafeCheckpointPayload{
+          .databaseUuid = manifest.identity.databaseUuid,
+          .generation = manifest.identity.generation,
+          .durableWalLsn = manifest.identity.snapshotLsn,
+          .transactionHighWater = manifest.transactionHighWater,
+        });
+        const auto anchor = LogRecord{LogSequenceNumber{manifest.identity.snapshotLsn + 1},
+                                      LogRecordType::SafeCheckpoint, payload}.serialize();
+        if (IoFaultInjector::isArmed(IoFaultPoint::ReductionPartialFrame)) {
+          output.write(reinterpret_cast<const char*>(anchor.data()), anchor.size() / 2);
+          output.close();
+          if (!output) throw std::runtime_error("Failed to write partial reduced WAL boundary");
+          IoFaultInjector::failIfArmed(IoFaultPoint::ReductionPartialFrame);
+        }
+        output.write(reinterpret_cast<const char*>(anchor.data()), anchor.size());
+        IoFaultInjector::failIfArmed(IoFaultPoint::ReductionAnchorWritten);
+      } else {
+        std::array<char, 64 * 1024> buffer{};
+        while (oldWal.read(buffer.data(), buffer.size()) || oldWal.gcount() != 0) {
+          output.write(buffer.data(), oldWal.gcount());
+        }
       }
       IoFaultInjector::failIfArmed(IoFaultPoint::SnapshotCloseFile);
       output.close();
-      if (oldWal.bad() || !oldWal.eof() || !output) throw std::runtime_error("Failed to copy snapshot WAL records");
+      if (oldWal.bad() || (!manifest.identity.reducedHistory && !oldWal.eof()) || !output) {
+        throw std::runtime_error("Failed to copy snapshot WAL records");
+      }
     }
     std::filesystem::remove(stagedWal);
     publishFile(newWal, stagedWal);
@@ -292,7 +353,7 @@ void DatabaseRuntime::snapshotTo(const std::filesystem::path& sourcePath,
     IoFaultInjector::failIfArmed(IoFaultPoint::SnapshotParentDurable);
   } catch (...) {
     std::error_code ignored;
-    for (const auto& path : {newWal, stagedWal, stagedData, stagedLock, baselinePath, manifestPath, staging}) {
+    for (const auto& path : {newWal, stagedWalLock, stagedWal, stagedData, stagedLock, baselinePath, manifestPath, staging}) {
       std::filesystem::remove(path, ignored);
     }
     throw;
@@ -300,12 +361,25 @@ void DatabaseRuntime::snapshotTo(const std::filesystem::path& sourcePath,
 }
 
 SnapshotManifest DatabaseRuntime::verifySnapshot(const std::filesystem::path& path, bool baselineOnly) {
-  if (baselineOnly) return SnapshotBaseline(path).manifest();
-  DatabaseFileLock lock(path);
-  if (!SnapshotBaseline::existsFor(path)) throw std::runtime_error("Snapshot manifest and baseline are missing");
+  if (baselineOnly && !std::filesystem::exists(std::filesystem::symlink_status(walInstallationPath(path)))) {
+    return SnapshotBaseline(path).manifest();
+  }
+  auto lock = std::make_shared<DatabaseFileLock>(path);
+  const auto installation = FileManager::resolveInstallation(path);
+  const auto selected = installation ? installation->targetPath : path;
+  std::shared_ptr<DatabaseFileLock> selectedLock;
+  if (installation) selectedLock = std::make_shared<DatabaseFileLock>(selected);
+  if (baselineOnly) {
+    const auto manifest = SnapshotBaseline(selected).manifest();
+    if (installation && manifest.identity != installation->target) throw std::runtime_error("Installed baseline identity mismatch");
+    return manifest;
+  }
+  const auto& database = selected;
+  if (!SnapshotBaseline::existsFor(database)) throw std::runtime_error("Snapshot manifest and baseline are missing");
   FileManager files;
-  files.openReadOnly(path);
-  LogManager wal(databaseWalPath(path), files.header(), files.walIdentity(), true);
+  files.openReadOnly(database);
+  if (installation && files.walIdentity() != std::optional{installation->target}) throw std::runtime_error("Installed snapshot identity mismatch");
+  LogManager wal(databaseWalPath(database), files.header(), files.walIdentity(), true, selectedLock ? selectedLock : lock);
   const auto context = wal.prepareRecovery();
   if (wal.hasPendingTail()) throw std::runtime_error("Snapshot verification found an incomplete WAL tail");
   const auto& records = context.records();

@@ -50,6 +50,7 @@ StorageMutationCoordinator::~StorageMutationCoordinator() {
 void StorageMutationCoordinator::writePagesAtomically(
     std::vector<Page> pages, std::optional<DatabaseHeader> beforeHeader,
     std::optional<std::uint64_t> resultingPageCount) {
+  auto operation = files_.operation();
   std::lock_guard lock(mutex_);
   if (pages.empty() && !beforeHeader) return;
 

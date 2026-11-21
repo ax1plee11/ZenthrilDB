@@ -20,6 +20,7 @@ void test_buffer_manager() {
   page.header().usedBytes = 4;
   fm.writePage(page);
 
+  {
   BufferManager buffer(fm, 2);
   auto& cached = buffer.pin(kDatabaseMetadataPageId);
   assert(cached.header().pageId == kDatabaseMetadataPageId);
@@ -44,7 +45,9 @@ void test_buffer_manager() {
   third.header().pageId = kFirstUserPageId;
   third.header().pageType = PageType::Metadata;
   fm.writePage(third);
+  }
 
+  {
   BufferManager smallBuffer(fm, 1);
   {
     auto guard = smallBuffer.pinGuard(kDatabaseMetadataPageId);
@@ -52,6 +55,7 @@ void test_buffer_manager() {
   }
   auto secondGuard = smallBuffer.pinGuard(kPageDirectoryPageId);
   assert(secondGuard.page().header().pageId == kPageDirectoryPageId);
+  }
 
   fm.closeDatabase();
   removeTestDatabaseArtifacts(path);

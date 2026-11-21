@@ -48,9 +48,24 @@ void SnapshotBaseline::validateWal(const std::filesystem::path& path, const Reco
   std::uint64_t prefixBytes = WalIdentity::kSize;
   std::uint64_t highWater = 0;
   bool found = boundary == 0;
+  const bool reduced = manifest_.identity.reducedHistory;
+  if (reduced) {
+    if (context.records().empty()) throw std::runtime_error("Reduced WAL is missing its baseline boundary");
+    const auto& anchor = context.records().front();
+    if (anchor.type() != LogRecordType::SafeCheckpoint || anchor.lsn().value() != boundary + 1) {
+      throw std::runtime_error("Reduced WAL has an invalid baseline boundary");
+    }
+    const auto checkpoint = LogPayloadCodec::decodeSafeCheckpoint(anchor.payload());
+    if (checkpoint.databaseUuid != manifest_.identity.databaseUuid ||
+        checkpoint.generation != manifest_.identity.generation || checkpoint.durableWalLsn != boundary) {
+      throw std::runtime_error("Reduced WAL boundary identity mismatch");
+    }
+    highWater = checkpoint.transactionHighWater;
+    found = true;
+  }
   for (const auto& record : context.records()) {
     const auto lsn = record.lsn().value();
-    if (lsn <= boundary) {
+    if (lsn <= boundary || (reduced && &record == &context.records().front())) {
       const auto frameSize = LogRecord::kHeaderSize + record.payload().size();
       if (frameSize > manifest_.walPrefixBytes - prefixBytes) {
         throw std::runtime_error("Snapshot WAL prefix length mismatch");

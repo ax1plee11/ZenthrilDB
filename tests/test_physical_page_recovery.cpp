@@ -116,7 +116,7 @@ void assertValidTwice(const std::filesystem::path& path, const FixturePages& pag
 void stageUncommittedPageWrite(const std::filesystem::path& path, PageId pageId) {
   FileManager files;
   files.openDatabase(path);
-  LogManager log(databaseWalPath(path), files.header(), files.walIdentity());
+  LogManager log(databaseWalPath(path), files.header(), files.walIdentity(), false, files.ownership());
   TransactionManager transactions(log);
   const auto tx = transactions.begin();
   const auto before = files.readPage(pageId);

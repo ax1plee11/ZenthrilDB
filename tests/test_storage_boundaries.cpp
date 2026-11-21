@@ -89,7 +89,7 @@ void test_storage_boundaries() {
 
   FileManager fm;
   fm.createDatabase(path);
-  LogManager wal(databaseWalPath(path));
+  LogManager wal(databaseWalPath(path), fm.ownership());
   TransactionManager transactions(wal);
   StorageMutationCoordinator coordinator(fm, wal, transactions);
   FreePageManager freePages(fm, coordinator);
@@ -101,6 +101,7 @@ void test_storage_boundaries() {
   freePages.freePage(pageId);
   assert(freePages.freePages().size() == 1);
 
+  wal.close();
   fm.closeDatabase();
   removeTestDatabaseArtifacts(path);
 }

@@ -118,6 +118,25 @@ jobs:
           if ($LASTEXITCODE -eq 0) { throw 'Snapshot accepted an existing destination' }
           Assert-DatabasePairHashes $snapshot $snapshotHashes
           Assert-DatabasePairHashes $work $sourceBeforeSnapshot
+          $requiredSnapshot = Join-Path $work 'required snapshot'
+          Invoke-Database snapshot $database $requiredSnapshot --require-baseline
+          Invoke-Database verify-snapshot (Join-Path $requiredSnapshot 'sample.zdb')
+          Assert-DatabasePairHashes $work $sourceBeforeSnapshot
+          $reducedDirectory = Join-Path $work 'reduced WAL'
+          Invoke-Database reduce-wal $database $reducedDirectory
+          $reducedData = Join-Path $reducedDirectory 'sample.zdb'
+          Invoke-Database verify-snapshot $reducedData
+          Invoke-Database check $reducedData
+          if ((Get-Item (Join-Path $reducedDirectory 'sample.wal')).Length -ne 148 -or
+              (Invoke-Database get $reducedData events key) -cne '76616c7565') {
+            throw 'Reduced candidate has an invalid boundary or lost a confirmed value'
+          }
+          Invoke-Database put $reducedData events after '6166746572'
+          $reducedCheckpoint = Invoke-Database checkpoint $reducedData | ConvertFrom-Json
+          if ($reducedCheckpoint.transaction_high_water -le $checkpoint.transaction_high_water) {
+            throw 'Reduced candidate reused a transaction ID'
+          }
+          Assert-DatabasePairHashes $work $sourceBeforeSnapshot
           Invoke-Database put $snapshotData events newer '6e65776572'
           Invoke-Database checkpoint $snapshotData
           $snapshotBackup = Join-Path $work 'snapshot backup'

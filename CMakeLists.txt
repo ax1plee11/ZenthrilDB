@@ -22,6 +22,8 @@ add_library(zenthrildb_core
   core/SnapshotBaseline.cpp
   core/StorageConsistencyChecker.hpp
   core/DatabaseRuntime.cpp
+  core/WalReductionInstallation.cpp
+  storage/WalInstallation.cpp
   core/DatabaseRuntime.hpp
   core/RecordManager.cpp
   core/RecordManager.hpp
@@ -110,6 +112,7 @@ if(ZENTHRILDB_BUILD_TESTS)
     tests/test_binary_io.cpp
     tests/test_lock_manager.cpp
     tests/test_storage_faults.cpp
+    tests/test_storage_hardening.cpp
     tests/test_header_recovery.cpp
     tests/test_database_runtime.cpp
     tests/test_database_wal_identity.cpp
@@ -121,6 +124,10 @@ if(ZENTHRILDB_BUILD_TESTS)
     tests/test_checkpoint_crash.cpp
     tests/test_snapshot_foundation.cpp
     tests/test_snapshot_publication.cpp
+    tests/test_wal_reduction.cpp
+    tests/test_wal_installation.cpp
+    tests/test_database_lifecycle.cpp
+    tests/benchmark_lifecycle.cpp
   )
 
   target_link_libraries(zenthrildb_tests PRIVATE zenthrildb_core)
@@ -137,6 +144,14 @@ if(ZENTHRILDB_BUILD_TESTS)
   set_tests_properties(ZenthrilDBCheckpoint PROPERTIES LABELS checkpoint)
   add_test(NAME ZenthrilDBSnapshot COMMAND zenthrildb_tests --snapshot-only)
   set_tests_properties(ZenthrilDBSnapshot PROPERTIES LABELS snapshot)
+  add_test(NAME ZenthrilDBReduction COMMAND zenthrildb_tests --reduction-only)
+  set_tests_properties(ZenthrilDBReduction PROPERTIES LABELS reduction TIMEOUT 240)
+  add_test(NAME ZenthrilDBInstallation COMMAND zenthrildb_tests --installation-only)
+  set_tests_properties(ZenthrilDBInstallation PROPERTIES LABELS installation TIMEOUT 300)
+  add_test(NAME ZenthrilDBLifecycle COMMAND zenthrildb_tests --lifecycle-only)
+  set_tests_properties(ZenthrilDBLifecycle PROPERTIES LABELS lifecycle TIMEOUT 300)
+  add_test(NAME ZenthrilDBHardening COMMAND zenthrildb_tests --hardening-only)
+  set_tests_properties(ZenthrilDBHardening PROPERTIES LABELS "security;hardening" TIMEOUT 120)
 endif()
 
 include(GNUInstallDirs)
@@ -156,6 +171,9 @@ install(FILES
   docs/CHECKPOINT_AUDIT_RU.md
   docs/SNAPSHOT_AUDIT_RU.md
   docs/SNAPSHOT_FOUNDATION_RU.md
+  docs/STATUS_STAGE_5_WAL_REDUCTION_RU.md
+  docs/STATUS_STAGE_6_CRASH_SAFE_WAL_INSTALLATION_RU.md
+  docs/STATUS_STAGE_7_DATABASE_LIFECYCLE_WRITER_SAFETY_RU.md
   DESTINATION ${CMAKE_INSTALL_DOCDIR}/docs
 )
 install(DIRECTORY docs/architecture docs/roadmap docs/security

@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <system_error>
+#include "storage/SafeFilePath.hpp"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -17,10 +18,11 @@
 namespace zenthrildb::detail {
 
 inline void syncFileToStorage(const std::filesystem::path& path) {
+  validateStoragePath(path);
 #ifdef _WIN32
   const auto handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
   if (handle == INVALID_HANDLE_VALUE) {
     throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
                             "Failed to open file for durable flush");
@@ -33,7 +35,7 @@ inline void syncFileToStorage(const std::filesystem::path& path) {
                             "Failed to durably flush file");
   }
 #else
-  const auto descriptor = ::open(path.c_str(), O_RDWR);
+  const auto descriptor = ::open(path.c_str(), O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
   if (descriptor == -1) {
     throw std::system_error(errno, std::generic_category(), "Failed to open file for durable flush");
   }

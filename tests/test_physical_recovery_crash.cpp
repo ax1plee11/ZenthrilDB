@@ -1,12 +1,14 @@
 #include "core/DatabaseRuntime.hpp"
 #include "storage/IoFaultInjector.hpp"
 #include "tests/TestDatabaseFiles.hpp"
+#include "wal/LogPayload.hpp"
 
 #include <array>
 #include <cassert>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -111,9 +113,128 @@ void runCrashProcess(const char* executablePath, const std::filesystem::path& da
   }
 #endif
 }
+std::string readFixtureBytes(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) throw std::runtime_error("Cannot read snapshot recovery fixture");
+  return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+RawPage stageSnapshotMutation(const std::filesystem::path& database, PageId id, bool commit) {
+  FileManager files;
+  files.openDatabase(database);
+  LogManager log(databaseWalPath(database), files.header(), files.walIdentity(), false, files.ownership());
+  TransactionManager transactions(log);
+  const auto transaction = transactions.begin();
+  const auto before = files.readPage(id);
+  auto after = before;
+  assert(after.header().pageType == PageType::Overflow && after.header().usedBytes > 0);
+  after.payload()[after.header().usedBytes - 1] = 10;
+  (void)log.appendWithLsn(LogRecordType::PageImageWritten, [&](LogSequenceNumber lsn) {
+    after.setPageLsn(lsn.value());
+    return LogPayloadCodec::encodePageImageWritten(PageImageWrittenPayload{
+      .transactionId = transaction.id(),
+      .pageId = id,
+      .previousTxLsn = 0,
+      .pageFormatVersion = Page::kFormatVersionV2,
+      .beforeImage = before.serialize(),
+      .afterImage = after.serialize(),
+    });
+  });
+  if (commit) {
+    transactions.commit(transaction.id());
+    return after.serialize();
+  }
+  log.flush();
+  files.writePage(after);
+  files.flush();
+  return before.serialize();
+}
+
+void checkSnapshotRecoveryCrashes(const char* executablePath, const std::filesystem::path& directory,
+                                 bool reduceHistory = false) {
+  const auto source = directory / "snapshot-source.zdb";
+  const auto published = directory / "baseline";
+  const std::vector<Byte> confirmed{7, 8, 9};
+  const std::vector<Byte> untouched{10, 11, 12};
+  constexpr auto changedId = kFirstUserPageId + 1;
+  constexpr auto untouchedId = kFirstUserPageId + 2;
+  {
+    DatabaseRuntime runtime(source, true);
+    (void)runtime.createTable("records");
+    runtime.records().put("records", "confirmed", confirmed);
+    runtime.records().put("records", "untouched", untouched);
+  }
+  const auto sourceData = readFixtureBytes(source);
+  const auto sourceWal = readFixtureBytes(databaseWalPath(source));
+  if (reduceHistory) DatabaseRuntime::reduceWalTo(source, published);
+  else DatabaseRuntime::snapshotTo(source, published, true);
+  const auto snapshot = published / source.filename();
+  assert(DatabaseRuntime::verifySnapshot(snapshot).identity.baselineRequired);
+  assert(DatabaseRuntime::verifySnapshot(snapshot).identity.reducedHistory == reduceHistory);
+  for (const std::string mode : {"baseline", "redo", "undo"}) {
+    const auto database = directory / (mode + ".zdb");
+    std::filesystem::copy_file(snapshot, database);
+    std::filesystem::copy_file(databaseWalPath(snapshot), databaseWalPath(database));
+    std::filesystem::copy_file(snapshotBaselinePath(snapshot), snapshotBaselinePath(database));
+    std::filesystem::copy_file(snapshotManifestPath(snapshot), snapshotManifestPath(database));
+    auto expected = readFixtureBytes(database);
+    const auto expectedPage = mode == "baseline" ? readRawPage(database, changedId)
+      : stageSnapshotMutation(database, changedId, mode == "redo");
+    expected.replace(static_cast<std::size_t>(pageOffset(changedId)), kDefaultPageSize,
+                     reinterpret_cast<const char*>(expectedPage.data()), expectedPage.size());
+    const auto originalUntouched = readRawPage(database, untouchedId);
+    const auto wal = readFixtureBytes(databaseWalPath(database));
+    const auto baseline = readFixtureBytes(snapshotBaselinePath(database));
+    const auto manifest = readFixtureBytes(snapshotManifestPath(database));
+    auto damaged = readRawPage(database, changedId);
+    damaged[PageHeader::serializedSize()] ^= 1;
+    writeRawPage(database, changedId, damaged);
+    auto damagedUntouched = originalUntouched;
+    damagedUntouched[PageHeader::serializedSize()] ^= 1;
+    writeRawPage(database, untouchedId, damagedUntouched);
+
+    runCrashProcess(executablePath, database);
+    assert(readRawPage(database, changedId) == expectedPage);
+    assert(readRawPage(database, untouchedId) == damagedUntouched);
+    assert(readFixtureBytes(databaseWalPath(database)) == wal);
+    runCrashProcess(executablePath, database);
+    assert(readFixtureBytes(database) == expected);
+    assert(readRawPage(database, untouchedId) == originalUntouched);
+    for (int reopen = 0; reopen < 2; ++reopen) {
+      DatabaseRuntime runtime(database);
+      const auto expectedValue = mode == "redo" ? std::vector<Byte>{7, 8, 10} : confirmed;
+      assert(runtime.records().get("records", "confirmed") == expectedValue);
+      assert(runtime.records().get("records", "untouched") == untouched);
+      (void)runtime.checkConsistency();
+    }
+    assert(DatabaseRuntime::verifySnapshot(database).identity.baselineRequired);
+    assert(readFixtureBytes(database) == expected);
+    assert(readFixtureBytes(databaseWalPath(database)) == wal);
+    assert(readFixtureBytes(snapshotBaselinePath(database)) == baseline);
+    assert(readFixtureBytes(snapshotManifestPath(database)) == manifest);
+    removeTestDatabaseArtifacts(database);
+  }
+  assert(readFixtureBytes(source) == sourceData);
+  assert(readFixtureBytes(databaseWalPath(source)) == sourceWal);
+  removeTestDatabaseArtifacts(snapshot);
+  std::filesystem::remove(published);
+  removeTestDatabaseArtifacts(source);
+}
+
 } // namespace
 #endif
 
+void test_reduced_recovery_crash(const char* executablePath) {
+#ifdef ZENTHRILDB_ENABLE_FAULT_INJECTION
+  const auto directory = std::filesystem::temp_directory_path() /
+    ("zenthrildb_reduced_recovery_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  assert(std::filesystem::create_directory(directory));
+  checkSnapshotRecoveryCrashes(executablePath, directory, true);
+  std::filesystem::remove(directory);
+#else
+  (void)executablePath;
+#endif
+}
 int runPhysicalRecoveryCrashChild(const char* path) {
 #ifdef ZENTHRILDB_ENABLE_FAULT_INJECTION
   IoFaultInjector::armCrash(IoFaultPoint::RecoveryPageRepair);
@@ -157,6 +278,7 @@ void test_physical_recovery_crash(const char* executablePath) {
     assert(recovered.checkConsistency().pagesChecked > recordPageId);
   }
   assert(readRawPage(database, recordPageId) == originalPage);
+  checkSnapshotRecoveryCrashes(executablePath, directory);
   removeTestDatabaseArtifacts(database);
   std::filesystem::remove(directory);
 #else

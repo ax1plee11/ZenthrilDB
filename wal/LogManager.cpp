@@ -12,6 +12,12 @@ namespace zenthrildb {
 LogManager::LogManager(std::filesystem::path walPath)
   : LogManager(std::move(walPath), std::nullopt) {}
 
+LogManager::LogManager(std::filesystem::path walPath, std::shared_ptr<DatabaseFileLock> ownership) {
+  wal_.open(walPath, true, false, std::move(ownership));
+  const auto records = readValidated();
+  if (!records.empty()) nextLsn_ = records.back().lsn().next();
+}
+
 LogManager::LogManager(std::filesystem::path walPath, const std::array<Byte, DatabaseHeader::kUuidSize>& databaseUuid)
   : LogManager(std::move(walPath), std::optional{databaseUuid}) {}
 
@@ -23,10 +29,10 @@ LogManager::LogManager(std::filesystem::path walPath,
 }
 
 LogManager::LogManager(std::filesystem::path walPath, const DatabaseHeader& header, std::optional<WalIdentity> identity,
-                       bool readOnly)
+                       bool readOnly, std::shared_ptr<DatabaseFileLock> ownership)
   : databaseUuid_(header.databaseUuid), identity_(identity), paired_(true) {
   if (!std::filesystem::is_regular_file(walPath)) throw std::runtime_error("Database WAL is missing or is not a regular file");
-  wal_.open(walPath, false, readOnly);
+  wal_.open(walPath, false, readOnly, std::move(ownership));
   const auto records = readValidated();
   if (!records.empty()) nextLsn_ = records.back().lsn().next();
 }

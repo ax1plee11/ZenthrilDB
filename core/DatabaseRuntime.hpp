@@ -31,16 +31,27 @@ public:
     return records_->renameTable(oldName, newName);
   }
   [[nodiscard]] bool dropTable(std::string_view name) { return records_->dropTable(name); }
-  [[nodiscard]] bool tableExists(std::string_view name) const { return metadata_->tableExists(std::string(name)); }
-  [[nodiscard]] std::vector<std::string> listTables() const { return metadata_->listTables(); }
+  [[nodiscard]] bool tableExists(std::string_view name) const {
+    std::lock_guard lock(operationsMutex_);
+    return metadata_->tableExists(std::string(name));
+  }
+  [[nodiscard]] std::vector<std::string> listTables() const {
+    std::lock_guard lock(operationsMutex_);
+    return metadata_->listTables();
+  }
   [[nodiscard]] StorageConsistencyReport checkConsistency();
   [[nodiscard]] CheckpointResult checkpoint();
   void backupTo(const std::filesystem::path& destinationDirectory);
-  static void snapshotTo(const std::filesystem::path& source, const std::filesystem::path& destinationDirectory);
+  static void snapshotTo(const std::filesystem::path& source, const std::filesystem::path& destinationDirectory,
+                         bool requireBaseline = false);
+  static void reduceWalTo(const std::filesystem::path& source, const std::filesystem::path& destinationDirectory);
+  static void installReduction(const std::filesystem::path& source, const std::filesystem::path& candidate);
   [[nodiscard]] static SnapshotManifest verifySnapshot(const std::filesystem::path& database,
                                                         bool baselineOnly = false);
 
 private:
+  static void createSnapshot(const std::filesystem::path& source, const std::filesystem::path& destinationDirectory,
+                             bool requireBaseline, bool reduceHistory);
   std::filesystem::path path_;
   FileManager files_;
   mutable std::recursive_mutex operationsMutex_;

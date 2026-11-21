@@ -28,6 +28,7 @@ void test_log_payload();
 void test_binary_io();
 void test_lock_manager();
 void test_storage_faults();
+void test_storage_hardening();
 void test_header_recovery();
 void test_database_runtime();
 void test_database_wal_identity();
@@ -37,14 +38,28 @@ void test_physical_page_recovery();
 void test_physical_recovery_crash(const char* executablePath);
 int runPhysicalRecoveryCrashChild(const char* path);
 void test_safe_checkpoint();
-void test_checkpoint_crash(const char* executablePath);
+void test_checkpoint_crash(const char* executablePath, bool reduceHistory = false);
 int runCheckpointCrashChild(const char* path, const char* phase);
 int runSnapshotPublicationChild(const char*, const char*, const char*);
 void test_snapshot_foundation();
-void test_snapshot_publication(const char*);
+void test_wal_reduction();
+void test_snapshot_publication(const char*, bool requireBaseline = false, bool reduceHistory = false);
+void test_reduced_recovery_crash(const char*);
 int runSnapshotCrashChild(const char* sourcePath, const char* destinationPath);
 
 int main(int argc, char** argv) {
+  if (argc == 3 && std::string_view(argv[1]) == "--lifecycle-benchmark") {
+    extern int benchmark_lifecycle(const char*);
+    return benchmark_lifecycle(argv[2]);
+  }
+  if (argc == 6 && std::string_view(argv[1]) == "--ownership-child") {
+    extern int runOwnershipChild(const char*, const char*, const char*, const char*);
+    return runOwnershipChild(argv[2], argv[3], argv[4], argv[5]);
+  }
+  if (argc == 5 && std::string_view(argv[1]) == "--install-child") {
+    extern int runInstallationChild(const char*, const char*, const char*);
+    return runInstallationChild(argv[2], argv[3], argv[4]);
+  }
   if (argc == 5 && std::string_view(argv[1]) == "--snapshot-publication-child") {
     return runSnapshotPublicationChild(argv[2], argv[3], argv[4]);
   }
@@ -71,9 +86,30 @@ int main(int argc, char** argv) {
                                  std::string_view(argv[4]) == "extend");
   }
   try {
+    if (argc == 2 && std::string_view(argv[1]) == "--lifecycle-only") {
+      extern void test_database_lifecycle(const char*);
+      test_database_lifecycle(argv[0]); return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--installation-only") {
+      extern void test_wal_installation(const char*);
+      test_wal_installation(argv[0]);
+      return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--reduction-only") {
+      test_wal_reduction();
+      test_snapshot_publication(argv[0], true, true);
+      test_reduced_recovery_crash(argv[0]);
+      test_checkpoint_crash(argv[0], true);
+      return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--hardening-only") {
+      test_storage_hardening();
+      return 0;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--snapshot-only") {
       test_snapshot_foundation();
       test_snapshot_publication(argv[0]);
+      test_snapshot_publication(argv[0], true);
       return 0;
     }
     if (argc == 2 && std::string_view(argv[1]) == "--checkpoint-only") {

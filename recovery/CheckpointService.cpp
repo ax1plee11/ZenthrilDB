@@ -20,6 +20,7 @@ LogSequenceNumber CheckpointService::checkpoint() {
 
 CheckpointResult CheckpointService::checkpoint(FileManager& files, PageManager& pages,
                                                TransactionManager& transactions) {
+  auto operation = files.operation();
   const auto& identity = files.walIdentity();
   if (!identity) throw std::logic_error("Safe checkpoint requires a bound database; create a snapshot first");
   if (transactions.activeCount() != 0) throw std::logic_error("Cannot checkpoint with active transactions");
@@ -31,6 +32,9 @@ CheckpointResult CheckpointService::checkpoint(FileManager& files, PageManager& 
   RecoveryCoordinator{}.verifyCheckpointState(files, logManager_, context, boundary);
   std::uint64_t txHighWater = 0;
   for (const auto& record : records) {
+    if (record.type() == LogRecordType::SafeCheckpoint) {
+      txHighWater = std::max(txHighWater, LogPayloadCodec::decodeSafeCheckpoint(record.payload()).transactionHighWater);
+    }
     if (record.type() == LogRecordType::TransactionStarted) {
       txHighWater = std::max(txHighWater, LogPayloadCodec::decodeTransaction(record.payload()).transactionId.value());
     }

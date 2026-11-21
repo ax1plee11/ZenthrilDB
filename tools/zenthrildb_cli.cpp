@@ -21,7 +21,7 @@ using zenthrildb::DatabaseRuntime;
 enum class Command {
   VerifySnapshot, VerifyBaseline,
   Checkpoint,
-  Create, Check, Backup, Snapshot, CreateTable, RenameTable, DropTable, ListTables, Put, Get, Erase, Scan,
+  Create, Check, Backup, Snapshot, ReduceWal, InstallWal, CreateTable, RenameTable, DropTable, ListTables, Put, Get, Erase, Scan,
 };
 
 struct Invocation {
@@ -38,6 +38,8 @@ constexpr Invocation invocations[] = {
   {"check", Command::Check, 1},
   {"backup", Command::Backup, 2},
   {"snapshot", Command::Snapshot, 2},
+  {"reduce-wal", Command::ReduceWal, 2},
+  {"install-wal", Command::InstallWal, 2},
   {"create-table", Command::CreateTable, 2},
   {"rename-table", Command::RenameTable, 3},
   {"drop-table", Command::DropTable, 2},
@@ -53,6 +55,9 @@ void printUsage(std::ostream& output) {
             "Usage: zenthrildb COMMAND DATABASE [ARGUMENTS]\n"
             "  create | check | checkpoint | list-tables DATABASE\n"
             "  backup | snapshot DATABASE NEW_DIRECTORY\n"
+            "  reduce-wal DATABASE NEW_DIRECTORY\n"
+            "  install-wal DATABASE CANDIDATE_DATABASE\n"
+            "  snapshot DATABASE NEW_DIRECTORY --require-baseline\n"
             "  verify-snapshot | verify-baseline DATABASE\n"
             "  create-table | drop-table | scan DATABASE TABLE\n"
             "  rename-table DATABASE TABLE NEW_NAME\n"
@@ -119,7 +124,9 @@ int run(std::span<const std::string> args) {
     return 2;
   }
   const auto invocation = std::ranges::find(invocations, std::string_view(args[0]), &Invocation::name);
-  if (invocation == std::end(invocations) || args.size() != invocation->argumentCount + 1) {
+  const bool requireBaseline = args[0] == "snapshot" && args.size() == 4 && args[3] == "--require-baseline";
+  if (invocation == std::end(invocations) ||
+      (args.size() != invocation->argumentCount + 1 && !requireBaseline)) {
     printUsage(std::cerr);
     return 2;
   }
@@ -136,7 +143,15 @@ int run(std::span<const std::string> args) {
     return 0;
   }
   if (command == Command::Snapshot) {
-    DatabaseRuntime::snapshotTo(path, pathFromUtf8(args[2]));
+    DatabaseRuntime::snapshotTo(path, pathFromUtf8(args[2]), requireBaseline);
+    return 0;
+  }
+  if (command == Command::ReduceWal) {
+    DatabaseRuntime::reduceWalTo(path, pathFromUtf8(args[2]));
+    return 0;
+  }
+  if (command == Command::InstallWal) {
+    DatabaseRuntime::installReduction(path, pathFromUtf8(args[2]));
     return 0;
   }
   const auto value = command == Command::Put ? decodeValue(args[4]) : std::vector<Byte>{};
@@ -145,6 +160,8 @@ int run(std::span<const std::string> args) {
   switch (command) {
     case Command::VerifySnapshot:
     case Command::VerifyBaseline:
+    case Command::ReduceWal:
+    case Command::InstallWal:
       break;
     case Command::Checkpoint: {
       const auto result = db.checkpoint();

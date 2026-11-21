@@ -39,11 +39,19 @@ std::string readFixture(const std::filesystem::path& path) {
   return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
 }
 
-void assertPublished(const std::filesystem::path& database) {
+void publishFixture(const std::filesystem::path& source, const std::filesystem::path& destination,
+                    bool requireBaseline, bool reduceHistory) {
+  if (reduceHistory) DatabaseRuntime::reduceWalTo(source, destination);
+  else DatabaseRuntime::snapshotTo(source, destination, requireBaseline);
+}
+
+void assertPublished(const std::filesystem::path& database, bool requireBaseline, bool reduceHistory) {
   const auto wal = databaseWalPath(database);
   const auto dataBeforeVerification = readFixture(database);
   const auto walBeforeVerification = readFixture(wal);
-  (void)DatabaseRuntime::verifySnapshot(database);
+  const auto manifest = DatabaseRuntime::verifySnapshot(database);
+  assert(manifest.identity.baselineRequired == requireBaseline);
+  assert(manifest.identity.reducedHistory == reduceHistory);
   assert(readFixture(database) == dataBeforeVerification);
   assert(readFixture(wal) == walBeforeVerification);
   for (int attempt = 0; attempt < 2; ++attempt) {
@@ -102,8 +110,17 @@ constexpr PublicationPhase kIoFailures[] = {
   {"no-space", IoFaultPoint::NoSpace, false},
 };
 
+constexpr PublicationPhase kReductionPhases[] = {
+  {"reduction-boundary", IoFaultPoint::ReductionBoundary, false},
+  {"reduction-partial", IoFaultPoint::ReductionPartialFrame, false},
+  {"reduction-written", IoFaultPoint::ReductionAnchorWritten, false},
+};
+
 void runCrashProcess(const char* executablePath, const std::filesystem::path& source,
-                     const std::filesystem::path& destination, const char* phase) {
+                     const std::filesystem::path& destination, const char* phase,
+                     bool requireBaseline, bool reduceHistory) {
+  const auto prefix = reduceHistory ? "reduced/" : (requireBaseline ? "required/" : "");
+  const auto requestedPhase = std::string(prefix) + phase;
 #ifdef _WIN32
   (void)executablePath;
   std::wstring executable(32768, L'\0');
@@ -113,7 +130,7 @@ void runCrashProcess(const char* executablePath, const std::filesystem::path& so
   }
   executable.resize(length);
   const auto workingDirectory = source.parent_path();
-  const std::string_view narrowPhase(phase);
+  const std::string_view narrowPhase(requestedPhase);
   const std::wstring widePhase(narrowPhase.begin(), narrowPhase.end());
   auto command = L"\"" + executable + L"\" --snapshot-publication-child \"" +
     source.filename().wstring() + L"\" \"" + destination.filename().wstring() + L"\" " + widePhase;
@@ -143,7 +160,7 @@ void runCrashProcess(const char* executablePath, const std::filesystem::path& so
   if (child < 0) throw std::runtime_error("Failed to fork snapshot publication crash child");
   if (child == 0) {
     execl(executablePath, executablePath, "--snapshot-publication-child",
-          source.c_str(), destination.c_str(), phase, nullptr);
+          source.c_str(), destination.c_str(), requestedPhase.c_str(), nullptr);
     _exit(127);
   }
   const auto deadline = std::chrono::steady_clock::now() + kCrashTimeout;
@@ -184,6 +201,10 @@ void checkIncompleteStaging(const std::filesystem::path& destination, const std:
     const auto partialSize = std::filesystem::file_size(partialFile);
     assert(partialSize > 0 && partialSize < std::filesystem::file_size(originalFile));
   }
+  if (point == IoFaultPoint::ReductionPartialFrame) {
+    const auto size = std::filesystem::file_size(staging / "identity-wal.partial");
+    assert(size > WalIdentity::kSize && size < WalIdentity::kSize + LogRecord::kHeaderSize + 52);
+  }
   clearFixtureDirectory(staging);
 }
 
@@ -195,11 +216,11 @@ void assertNoStaging(const std::filesystem::path& destination) {
 }
 
 void checkIoFailure(const PublicationPhase& phase, const std::filesystem::path& source,
-                    const std::filesystem::path& destination) {
+                    const std::filesystem::path& destination, bool requireBaseline, bool reduceHistory) {
   IoFaultInjector::arm(phase.point);
   bool rejected = false;
   try {
-    DatabaseRuntime::snapshotTo(source, destination);
+    publishFixture(source, destination, requireBaseline, reduceHistory);
   } catch (const std::system_error& error) {
     const auto expectedError = phase.point == IoFaultPoint::NoSpace ? std::errc::no_space_on_device : std::errc::io_error;
     rejected = error.code() == expectedError;
@@ -216,10 +237,13 @@ void checkIoFailure(const PublicationPhase& phase, const std::filesystem::path& 
 
 int runSnapshotPublicationChild(const char* source, const char* destination, const char* phaseName) {
 #ifdef ZENTHRILDB_ENABLE_FAULT_INJECTION
-  const std::string_view requested(phaseName);
+  std::string_view requested(phaseName);
+  const bool reduceHistory = requested.starts_with("reduced/");
+  const bool requireBaseline = reduceHistory || requested.starts_with("required/");
+  if (requireBaseline) requested.remove_prefix(reduceHistory ? 8 : 9);
   if (requested == "before-call") std::_Exit(kCrashExitCode);
   if (requested == "after-return") {
-    DatabaseRuntime::snapshotTo(source, destination);
+    publishFixture(source, destination, requireBaseline, reduceHistory);
     {
       DatabaseFileLock sourceLock(source);
     }
@@ -228,8 +252,16 @@ int runSnapshotPublicationChild(const char* source, const char* destination, con
   for (const auto& phase : kPhases) {
     if (requested != phase.name) continue;
     IoFaultInjector::armCrash(phase.point);
-    DatabaseRuntime::snapshotTo(source, destination);
+    publishFixture(source, destination, requireBaseline, reduceHistory);
     return 2;
+  }
+  if (reduceHistory) {
+    for (const auto& phase : kReductionPhases) {
+      if (requested != phase.name) continue;
+      IoFaultInjector::armCrash(phase.point);
+      publishFixture(source, destination, true, true);
+      return 2;
+    }
   }
 #else
   (void)source;
@@ -239,7 +271,7 @@ int runSnapshotPublicationChild(const char* source, const char* destination, con
   return 2;
 }
 
-void test_snapshot_publication(const char* executablePath) {
+void test_snapshot_publication(const char* executablePath, bool requireBaseline, bool reduceHistory) {
   const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
   const auto parent = std::filesystem::temp_directory_path() /
     ("zenthrildb_snapshot_publication_" + std::to_string(stamp));
@@ -266,7 +298,7 @@ void test_snapshot_publication(const char* executablePath) {
   }
   bool rejected = false;
   try {
-    DatabaseRuntime::snapshotTo(source, existing);
+    publishFixture(source, existing, requireBaseline, reduceHistory);
   } catch (const std::invalid_argument&) {
     rejected = true;
   }
@@ -276,51 +308,61 @@ void test_snapshot_publication(const char* executablePath) {
 
 #ifdef ZENTHRILDB_ENABLE_FAULT_INJECTION
   const auto beforeCall = parent / "crash-before-call";
-  runCrashProcess(executablePath, source, beforeCall, "before-call");
+  runCrashProcess(executablePath, source, beforeCall, "before-call", requireBaseline, reduceHistory);
   assert(!std::filesystem::exists(beforeCall));
   assertNoStaging(beforeCall);
   assertSourceUnchanged();
 
   const auto afterReturn = parent / "crash-after-return";
-  runCrashProcess(executablePath, source, afterReturn, "after-return");
-  assertPublished(afterReturn / source.filename());
+  runCrashProcess(executablePath, source, afterReturn, "after-return", requireBaseline, reduceHistory);
+  assertPublished(afterReturn / source.filename(), requireBaseline, reduceHistory);
   assertNoStaging(afterReturn);
   assertSourceUnchanged();
   clearFixtureDirectory(afterReturn);
 
   const auto verifyIo = [&](const PublicationPhase& phase) {
     const auto failed = parent / (std::string("io-") + phase.name);
-    checkIoFailure(phase, source, failed);
+    checkIoFailure(phase, source, failed, requireBaseline, reduceHistory);
     assertSourceUnchanged();
     if (phase.published) {
-      assertPublished(failed / source.filename());
+      assertPublished(failed / source.filename(), requireBaseline, reduceHistory);
       clearFixtureDirectory(failed);
     } else {
       assert(!std::filesystem::exists(failed));
+      publishFixture(source, failed, requireBaseline, reduceHistory);
+      assertPublished(failed / source.filename(), requireBaseline, reduceHistory);
+      clearFixtureDirectory(failed);
     }
+    assertSourceUnchanged();
   };
-  for (const auto& phase : kPhases) {
+  const auto verifyCrashAndIo = [&](const PublicationPhase& phase) {
     const auto crashed = parent / (std::string("crash-") + phase.name);
-    runCrashProcess(executablePath, source, crashed, phase.name);
+    runCrashProcess(executablePath, source, crashed, phase.name, requireBaseline, reduceHistory);
     assertSourceUnchanged();
     if (phase.published) {
-      assertPublished(crashed / source.filename());
+      assertPublished(crashed / source.filename(), requireBaseline, reduceHistory);
       clearFixtureDirectory(crashed);
     } else {
       assert(!std::filesystem::exists(crashed));
       checkIncompleteStaging(crashed, source, phase.point);
+      publishFixture(source, crashed, requireBaseline, reduceHistory);
+      assertPublished(crashed / source.filename(), requireBaseline, reduceHistory);
+      clearFixtureDirectory(crashed);
     }
+    assertSourceUnchanged();
 
     verifyIo(phase);
-  }
+  };
+  for (const auto& phase : kPhases) verifyCrashAndIo(phase);
+  if (reduceHistory) for (const auto& phase : kReductionPhases) verifyCrashAndIo(phase);
   for (const auto& phase : kIoFailures) verifyIo(phase);
 #else
   (void)executablePath;
 #endif
 
   const auto finished = parent / "finished";
-  DatabaseRuntime::snapshotTo(source, finished);
-  assertPublished(finished / source.filename());
+  publishFixture(source, finished, requireBaseline, reduceHistory);
+  assertPublished(finished / source.filename(), requireBaseline, reduceHistory);
   assertSourceUnchanged();
   const auto publishedData = finished / source.filename();
   const auto publishedWal = databaseWalPath(publishedData);
@@ -328,7 +370,7 @@ void test_snapshot_publication(const char* executablePath) {
   const auto walBeforeRepeat = readFixture(publishedWal);
   bool repeatRejected = false;
   try {
-    DatabaseRuntime::snapshotTo(source, finished);
+    publishFixture(source, finished, requireBaseline, reduceHistory);
   } catch (const std::invalid_argument&) {
     repeatRejected = true;
   }

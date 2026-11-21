@@ -12,6 +12,12 @@ namespace zenthrildb {
 TransactionManager::TransactionManager(LogManager& logManager)
   : logAdapter_(logManager) {
   for (const auto& record : logManager.replay()) {
+    if (record.type() == LogRecordType::SafeCheckpoint) {
+      const auto highWater = LogPayloadCodec::decodeSafeCheckpoint(record.payload()).transactionHighWater;
+      if (highWater == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("Transaction id space exhausted");
+      nextId_ = std::max(nextId_, highWater + 1);
+      continue;
+    }
     if (record.type() != LogRecordType::TransactionStarted &&
         record.type() != LogRecordType::TransactionCommitted &&
         record.type() != LogRecordType::TransactionRolledBack) {

@@ -4,6 +4,8 @@
 #include "storage/DurableFileSync.hpp"
 #include "storage/IoFaultInjector.hpp"
 #include "wal/LogPayload.hpp"
+#include "storage/SafeFilePath.hpp"
+#include "storage/WalInstallation.hpp"
 
 #include <array>
 #include <fstream>
@@ -14,7 +16,10 @@
 
 namespace zenthrildb {
 
-WriteAheadLog::WriteAheadLog(std::filesystem::path path) {
+WriteAheadLog::WriteAheadLog(std::filesystem::path path, WalLimits limits) : limits_(limits) {
+  if (limits_.maxBytes < LogRecord::kHeaderSize || limits_.maxRecords == 0) {
+    throw std::invalid_argument("WAL limits must permit at least one frame");
+  }
   open(path);
 }
 
@@ -26,19 +31,29 @@ void WriteAheadLog::open(const std::filesystem::path& path) {
   open(path, true);
 }
 
-void WriteAheadLog::open(const std::filesystem::path& path, bool allowCreate, bool readOnly) {
+void WriteAheadLog::open(const std::filesystem::path& path, bool allowCreate, bool readOnly,
+                         std::shared_ptr<DatabaseFileLock> ownership) {
   std::lock_guard lock(mutex_);
-  if (stream_.is_open()) {
-    stream_.flush();
-    if (!stream_) throw std::runtime_error("Failed to flush WAL before reopening");
-    detail::syncFileToStorage(path_);
-    stream_.close();
-  }
+  if (stream_.is_open()) close();
+  const auto physical = std::filesystem::absolute(path).lexically_normal();
+  auto database = physical; database.replace_extension(".zdb");
+  std::shared_ptr<DatabaseFileLock> databaseOwner;
+  if (std::filesystem::exists(database)) {
+    if (std::filesystem::exists(std::filesystem::symlink_status(walInstallationPath(database)))) {
+      throw std::logic_error("Direct WAL access to an installed source is forbidden");
+    }
+    if (ownership && ownership->databasePath() != database) throw std::logic_error("WAL ownership belongs to another database");
+    databaseOwner = ownership ? std::move(ownership) : std::make_shared<DatabaseFileLock>(database);
+    (void)databaseOwner->guard();
+  } else if (ownership) throw std::logic_error("WAL ownership requires its existing database");
+  auto walOwner = std::make_shared<DatabaseFileLock>(physical, false);
   path_ = path;
   readOnly_ = readOnly;
   incompleteTailRepaired_ = false;
   incompleteTailOffset_.reset();
   hasIdentity_ = false;
+  recordCount_.reset();
+  detail::validateStoragePath(path_, allowCreate);
   std::error_code existsError;
   const auto alreadyExists = std::filesystem::exists(path_, existsError);
   if (existsError) {
@@ -47,14 +62,7 @@ void WriteAheadLog::open(const std::filesystem::path& path, bool allowCreate, bo
   createdOnOpen_ = !alreadyExists;
   if (!alreadyExists) {
     if (!allowCreate) throw std::runtime_error("Database WAL is missing");
-    std::ofstream create(path_, std::ios::binary | std::ios::app);
-    if (!create) {
-      throw std::runtime_error("Failed to create WAL file");
-    }
-    create.close();
-    if (!create) {
-      throw std::runtime_error("Failed to close newly created WAL file");
-    }
+    detail::createStorageFileExclusive(path_);
     detail::syncFileToStorage(path_);
     detail::syncDirectoryToStorage(path_.parent_path());
   }
@@ -62,10 +70,14 @@ void WriteAheadLog::open(const std::filesystem::path& path, bool allowCreate, bo
   if (!stream_) {
     throw std::runtime_error("Failed to open existing WAL file without truncation");
   }
+  databaseOwner_ = std::move(databaseOwner);
+  walOwner_ = std::move(walOwner);
 }
 
 void WriteAheadLog::close() {
   std::lock_guard lock(mutex_);
+  const auto retained = databaseOwner_ ? databaseOwner_ : walOwner_;
+  auto ownership = retained ? retained->cleanupGuard() : std::unique_lock<std::recursive_mutex>{};
   if (stream_.is_open()) {
     if (!readOnly_) {
       stream_.flush();
@@ -75,16 +87,35 @@ void WriteAheadLog::close() {
     stream_.close();
     if (stream_.fail()) throw std::runtime_error("Failed to close WAL file");
   }
+  walOwner_.reset();
+  databaseOwner_.reset();
+}
+
+std::unique_lock<std::recursive_mutex> WriteAheadLog::ownershipGuard() const {
+  if (databaseOwner_) return databaseOwner_->guard();
+  if (walOwner_) return walOwner_->guard();
+  throw std::logic_error("WAL has no ownership");
 }
 
 void WriteAheadLog::append(const LogRecord& record) {
   std::lock_guard lock(mutex_);
+  auto ownership = ownershipGuard();
   ensureOpen();
   if (readOnly_) throw std::logic_error("Cannot append to a read-only WAL");
   if (incompleteTailOffset_) throw std::runtime_error("WAL has an incomplete tail");
-  const auto bytes = record.serialize();
+  if (!recordCount_) (void)readAll({}, nullptr, false);
+  if (incompleteTailOffset_) throw std::runtime_error("WAL has an incomplete tail");
+  if (*recordCount_ >= limits_.maxRecords) throw std::length_error("WAL record limit reached; preserve and rotate the database offline");
   stream_.seekp(0, std::ios::end);
   if (!stream_) throw std::runtime_error("Failed to seek to WAL end");
+  const auto end = stream_.tellp();
+  if (end < 0) throw std::runtime_error("Cannot determine WAL length");
+  const auto size = static_cast<std::uintmax_t>(end);
+  const auto frameBytes = static_cast<std::uintmax_t>(LogRecord::kHeaderSize) + record.payload().size();
+  if (size > limits_.maxBytes || frameBytes > limits_.maxBytes - size) {
+    throw std::length_error("WAL byte limit reached; preserve and rotate the database offline");
+  }
+  const auto bytes = record.serialize();
   IoFaultInjector::failIfArmed(IoFaultPoint::NoSpace);
   IoFaultInjector::failIfArmed(IoFaultPoint::WalWrite);
   const bool checkpointPartial = record.type() == LogRecordType::SafeCheckpoint &&
@@ -101,6 +132,7 @@ void WriteAheadLog::append(const LogRecord& record) {
   if (!stream_) {
     throw std::runtime_error("Failed to append WAL record");
   }
+  ++*recordCount_;
 }
 
 std::vector<LogRecord> WriteAheadLog::readAll() {
@@ -111,10 +143,14 @@ std::vector<LogRecord> WriteAheadLog::readAll(
     const std::function<void(const LogRecord&)>& validate,
     const std::optional<WalIdentity>* expectedIdentity, bool repair) {
   std::lock_guard lock(mutex_);
+  auto ownership = ownershipGuard();
   ensureOpen();
   stream_.flush();
   if (!stream_) {
     throw std::runtime_error("Failed to flush WAL before replay");
+  }
+  if (std::filesystem::file_size(path_) > limits_.maxBytes) {
+    throw std::length_error("WAL exceeds replay byte limit");
   }
   stream_.clear();
   stream_.seekg(0, std::ios::beg);
@@ -130,12 +166,16 @@ std::vector<LogRecord> WriteAheadLog::readAll(
 
   std::vector<LogRecord> records;
   std::uintmax_t validBytes = identity ? WalIdentity::kSize : 0;
-  auto snapshotLsnSeen = !identity || identity->snapshotLsn == 0;
-  std::uint64_t previousLsn = 0;
+  const bool reduced = identity && identity->reducedHistory;
+  bool anchorSeen = !reduced;
+  auto snapshotLsnSeen = reduced || !identity || identity->snapshotLsn == 0;
+  std::uint64_t previousLsn = reduced ? identity->snapshotLsn : 0;
   std::uint64_t transactionHighWater = 0;
   const auto noteTail = [&] {
+    if (!anchorSeen) throw std::runtime_error("Reduced WAL boundary record is missing or incomplete");
     if (!snapshotLsnSeen) throw std::runtime_error("WAL does not reach the snapshot LSN");
     incompleteTailOffset_ = validBytes;
+    recordCount_ = records.size();
     if (repair && !identity) repairPendingTail();
     else stream_.clear();
   };
@@ -153,6 +193,7 @@ std::vector<LogRecord> WriteAheadLog::readAll(
       noteTail();
       return records;
     }
+    if (records.size() >= limits_.maxRecords) throw std::length_error("WAL exceeds replay record limit");
 
     std::size_t offset = 0;
     const auto magic = binary::readLittleEndian<std::uint32_t>(header, offset);
@@ -171,6 +212,10 @@ std::vector<LogRecord> WriteAheadLog::readAll(
     if (identity && (lsn <= previousLsn || lsn == std::numeric_limits<std::uint64_t>::max())) {
       throw std::runtime_error("Invalid bound WAL frame LSN sequence");
     }
+    if (!anchorSeen && (type != static_cast<std::uint32_t>(LogRecordType::SafeCheckpoint) ||
+        lsn != identity->snapshotLsn + 1)) {
+      throw std::runtime_error("Invalid reduced WAL boundary record");
+    }
     if (identity && type == static_cast<std::uint32_t>(LogRecordType::Checkpoint) && payloadSize != 0) {
       throw std::runtime_error("Invalid checkpoint payload for this WAL version");
     }
@@ -180,6 +225,10 @@ std::vector<LogRecord> WriteAheadLog::readAll(
     }
     if (payloadSize > LogRecord::kMaxPayloadSize) {
       throw std::runtime_error("Corrupted WAL: payload exceeds maximum size");
+    }
+    if (validBytes > limits_.maxBytes || header.size() > limits_.maxBytes - validBytes ||
+        payloadSize > limits_.maxBytes - validBytes - header.size()) {
+      throw std::length_error("WAL frame exceeds replay byte limit");
     }
     std::vector<Byte> payload(payloadSize);
     if (payloadSize > 0) {
@@ -199,6 +248,7 @@ std::vector<LogRecord> WriteAheadLog::readAll(
     }
     if (record.type() == LogRecordType::SafeCheckpoint) {
       const auto checkpoint = LogPayloadCodec::decodeSafeCheckpoint(record.payload());
+      if (!anchorSeen) transactionHighWater = checkpoint.transactionHighWater;
       if (checkpoint.databaseUuid != identity->databaseUuid ||
           (lsn > identity->snapshotLsn && checkpoint.generation != identity->generation) ||
           checkpoint.durableWalLsn != previousLsn || checkpoint.transactionHighWater != transactionHighWater) {
@@ -209,15 +259,19 @@ std::vector<LogRecord> WriteAheadLog::readAll(
     previousLsn = lsn;
     if (identity && record.lsn().value() == identity->snapshotLsn) snapshotLsnSeen = true;
     records.push_back(std::move(record));
+    anchorSeen = true;
     validBytes += header.size() + payload.size();
   }
   if (!snapshotLsnSeen) throw std::runtime_error("WAL does not reach the snapshot LSN");
+  if (!anchorSeen) throw std::runtime_error("Reduced WAL boundary record is missing");
   stream_.clear();
+  recordCount_ = records.size();
   return records;
 }
 
 void WriteAheadLog::flush() {
   std::lock_guard lock(mutex_);
+  auto ownership = ownershipGuard();
   ensureOpen();
   if (readOnly_) throw std::logic_error("Cannot synchronize a read-only WAL");
   stream_.flush();
@@ -231,14 +285,14 @@ void WriteAheadLog::flush() {
 
 void WriteAheadLog::truncate(LogSequenceNumber inclusiveMaxLsn) {
   std::lock_guard lock(mutex_);
+  auto ownership = ownershipGuard();
   ensureOpen();
   const auto records = readAll();
   if (hasIdentity_) throw std::logic_error("WAL reclamation is disabled for bound databases");
 
   auto tempPath = path_;
   tempPath += ".rewrite.tmp";
-  std::error_code removeError;
-  std::filesystem::remove(tempPath, removeError);
+  detail::createStorageFileExclusive(tempPath);
 
   {
     std::ofstream replacement(tempPath, std::ios::binary | std::ios::trunc);
@@ -276,10 +330,12 @@ void WriteAheadLog::truncate(LogSequenceNumber inclusiveMaxLsn) {
 #endif
   stream_.open(path_, std::ios::binary | std::ios::in | std::ios::out | std::ios::app);
   if (!stream_) throw std::runtime_error("Failed to reopen WAL after atomic replacement");
+  recordCount_.reset();
 }
 
 void WriteAheadLog::repairPendingTail() {
   std::lock_guard lock(mutex_);
+  auto ownership = ownershipGuard();
   if (!incompleteTailOffset_) return;
   if (readOnly_) throw std::logic_error("Cannot repair a read-only WAL");
   truncateIncompleteTail(*incompleteTailOffset_);

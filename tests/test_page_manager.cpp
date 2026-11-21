@@ -24,7 +24,7 @@ void test_page_manager() {
 
   FileManager fm;
   fm.createDatabase(path);
-  LogManager wal(databaseWalPath(path));
+  LogManager wal(databaseWalPath(path), fm.ownership());
   TransactionManager transactions(wal);
   StorageMutationCoordinator coordinator(fm, wal, transactions);
   bool duplicateCoordinatorRejected = false;
@@ -101,6 +101,7 @@ void test_page_manager() {
   assert(allocated[0] != allocated[1]);
   (void)StorageConsistencyChecker{}.check(fm, freePages, metadata, wal);
 
+  wal.close();
   fm.closeDatabase();
   removeTestDatabaseArtifacts(path);
 }

@@ -18,7 +18,7 @@ void test_metadata_manager() {
 
   FileManager fm;
   fm.createDatabase(path);
-  LogManager metadataWal(databaseWalPath(path));
+  LogManager metadataWal(databaseWalPath(path), fm.ownership());
   TransactionManager transactions(metadataWal);
   StorageMutationCoordinator mutationCoordinator(fm, metadataWal, transactions);
   FreePageManager freePages(fm, mutationCoordinator);
@@ -48,11 +48,12 @@ void test_metadata_manager() {
   assert(afterUpdate->pageCount() == 2);
 
   metadata.saveMetadata();
+  metadataWal.close();
   fm.closeDatabase();
 
   FileManager reopened;
   reopened.openDatabase(path);
-  LogManager recoveredWal(databaseWalPath(path));
+  LogManager recoveredWal(databaseWalPath(path), reopened.ownership());
   TransactionManager recoveredTransactions(recoveredWal);
   StorageMutationCoordinator recoveredCoordinator(reopened, recoveredWal, recoveredTransactions);
   FreePageManager reopenedFreePages(reopened, recoveredCoordinator);
@@ -74,10 +75,11 @@ void test_metadata_manager() {
     reopened, reopenedFreePages, recovered, recoveredWal);
   assert(afterDeleteConsistency.transactionsChecked >= 4);
 
+  recoveredWal.close();
   reopened.closeDatabase();
   FileManager afterDelete;
   afterDelete.openDatabase(path);
-  LogManager afterDeleteWal(databaseWalPath(path));
+  LogManager afterDeleteWal(databaseWalPath(path), afterDelete.ownership());
   TransactionManager afterDeleteTransactions(afterDeleteWal);
   StorageMutationCoordinator afterDeleteCoordinator(afterDelete, afterDeleteWal, afterDeleteTransactions);
   FreePageManager afterDeleteFreePages(afterDelete, afterDeleteCoordinator);
@@ -87,6 +89,7 @@ void test_metadata_manager() {
   assert(!afterDeleteMetadata.tableExists("ledger"));
   assert(afterDeleteFreePages.freePages().contains(recoveredTable->rootPageId()));
   (void)StorageConsistencyChecker{}.check(afterDelete, afterDeleteFreePages, afterDeleteMetadata, afterDeleteWal);
+  afterDeleteWal.close();
   afterDelete.closeDatabase();
   removeTestDatabaseArtifacts(path);
 }

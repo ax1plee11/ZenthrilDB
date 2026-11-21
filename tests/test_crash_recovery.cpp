@@ -76,11 +76,11 @@ int runCrashCommitChild(const char* walPath, const char* readyPath) {
 
 
 int runCrashPageChild(const char* databasePath, const char* walPath, const char* readyPath, bool commit) {
-  LogManager log{std::filesystem::path(walPath)};
-  TransactionManager transactions(log);
-  const auto transaction = transactions.begin();
   FileManager files;
   files.openDatabase(std::filesystem::path(databasePath));
+  LogManager log{std::filesystem::path(walPath), files.ownership()};
+  TransactionManager transactions(log);
+  const auto transaction = transactions.begin();
   auto before = files.readPage(kFirstUserPageId);
   auto after = before;
   after.payload()[0] = 0x42;
@@ -129,9 +129,9 @@ int runCrashRecoveryChild(const char* databasePath, const char* walPath, const c
     const char* readyPath_;
   };
 
-  LogManager log{std::filesystem::path(walPath)};
   FileManager files;
   files.openDatabase(std::filesystem::path(databasePath));
+  LogManager log{std::filesystem::path(walPath), files.ownership()};
   RecoveryEngine engine;
   const auto plan = engine.analyze(log.prepareRecovery());
   PageImageRecoveryApplier pageApplier(files);
@@ -154,7 +154,7 @@ int runCrashMetadataChild(const char* databasePath, std::size_t failWriteAt, boo
   }
   FileManager files;
   files.openDatabase(databasePath);
-  LogManager wal(databaseWalPath(databasePath));
+  LogManager wal(databaseWalPath(databasePath), files.ownership());
   TransactionManager transactions(wal);
   StorageMutationCoordinator coordinator(files, wal, transactions);
   FreePageManager freePages(files, coordinator);
@@ -259,20 +259,21 @@ void test_crash_recovery(const char* executablePath) {
     {
       FileManager files;
       files.createDatabase(databasePath);
-      LogManager wal(databaseWalPath(databasePath));
+      LogManager wal(databaseWalPath(databasePath), files.ownership());
       TransactionManager transactions(wal);
       StorageMutationCoordinator coordinator(files, wal, transactions);
       FreePageManager freePages(files, coordinator);
       freePages.load();
       MetadataManager metadata(files, freePages, coordinator);
       (void)metadata.createTable("stable");
+      wal.close();
       files.closeDatabase();
     }
     crashMetadata(databasePath, failWriteAt, false);
     {
       FileManager reopened;
       reopened.openDatabase(databasePath);
-      LogManager wal(databaseWalPath(databasePath));
+      LogManager wal(databaseWalPath(databasePath), reopened.ownership());
       TransactionManager transactions(wal);
       StorageMutationCoordinator coordinator(reopened, wal, transactions);
       FreePageManager freePages(reopened, coordinator);
@@ -477,9 +478,9 @@ void test_crash_recovery(const char* executablePath) {
 #endif
     std::filesystem::remove(recoveryReadyPath);
     {
-      LogManager log{pageWalPath};
       FileManager files;
       files.openDatabase(databasePath);
+      LogManager log{pageWalPath, files.ownership()};
       RecoveryCoordinator coordinator;
       const auto firstRecovery = coordinator.recover(log, files);
       assert(firstRecovery.execution.redoApplied + firstRecovery.execution.undoApplied == 1);

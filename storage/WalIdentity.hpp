@@ -11,11 +11,15 @@ namespace zenthrildb {
 struct WalIdentity {
   static constexpr std::uint32_t kMagic = 0x4942445Au; // ZDBI
   static constexpr std::uint32_t kVersion = 1;
+  static constexpr std::uint32_t kBaselineRequiredVersion = 2;
+  static constexpr std::uint32_t kReducedHistoryVersion = 3;
   static constexpr std::size_t kSize = 60;
 
   std::array<Byte, 16> generation{};
   std::array<Byte, DatabaseHeader::kUuidSize> databaseUuid{};
   std::uint64_t snapshotLsn{};
+  bool baselineRequired{false};
+  bool reducedHistory{false};
 
   bool operator==(const WalIdentity&) const = default;
   [[nodiscard]] std::array<Byte, kSize> serialize() const;

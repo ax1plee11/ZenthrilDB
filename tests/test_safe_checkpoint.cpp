@@ -146,7 +146,7 @@ void checkAbandonedPageWrite(const std::filesystem::path& path) {
     auto after = before;
     assert(before.header().pageType == PageType::Overflow && before.header().usedBytes > 0);
     after.payload()[after.header().usedBytes - 1] ^= 0x20;
-    LogManager log(wal, files.header(), files.walIdentity());
+    LogManager log(wal, files.header(), files.walIdentity(), false, files.ownership());
     TransactionManager transactions(log);
     abandoned = transactions.begin().id();
     pageLsn = log.appendWithLsn(LogRecordType::PageImageWritten, [&](LogSequenceNumber assigned) {
@@ -237,6 +237,7 @@ void checkInvalidCheckpoints(const std::filesystem::path& directory) {
 }
 
 void checkRepeatableCheckpoints(const std::filesystem::path& path) {
+  {
   DatabaseRuntime database(path, true);
   (void)database.createTable("records");
   for (std::size_t i = 0; i < 20; ++i) {
@@ -261,6 +262,7 @@ void checkRepeatableCheckpoints(const std::filesystem::path& path) {
   assert(second.durableWalLsn == first.checkpointLsn);
   assert(first.checkpointLsn < second.checkpointLsn);
   assert(first.transactionHighWater == second.transactionHighWater);
+  }
   assertValidCheckpoints(path, 2);
 }
 
@@ -355,7 +357,7 @@ void checkLegacyCheckpointRejected(const std::filesystem::path& path) {
   {
     FileManager files;
     files.createDatabase(path);
-    LogManager log(databaseWalPath(path));
+    LogManager log(databaseWalPath(path), files.ownership());
     TransactionManager transactions(log);
     StorageMutationCoordinator mutations(files, log, transactions);
     FreePageManager freePages(files, mutations);

@@ -11,7 +11,11 @@ BufferManager::BufferManager(FileManager& fileManager, std::size_t capacityPages
   if (capacityPages_ == 0) {
     throw std::invalid_argument("Buffer capacity must be greater than zero");
   }
+  ownership_ = fileManager_.ownership();
+  ownership_->claimBuffer();
 }
+
+BufferManager::~BufferManager() { ownership_->releaseBuffer(); }
 
 Page& BufferManager::pin(PageId pageId) {
   std::lock_guard lock(mutex_);

@@ -195,7 +195,7 @@ void checkLegacyMigration(const std::filesystem::path& directory) {
     FileManager files;
     files.createDatabase(legacy);
     legacyUuid = files.header().databaseUuid;
-    LogManager log(databaseWalPath(legacy));
+    LogManager log(databaseWalPath(legacy), files.ownership());
     TransactionManager transactions(log);
     StorageMutationCoordinator mutations(files, log, transactions);
     FreePageManager freePages(files, mutations);

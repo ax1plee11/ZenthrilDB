@@ -138,7 +138,7 @@ int runCheckpointCrashChild(const char* path, const char* name) {
   return 2;
 }
 
-void test_checkpoint_crash(const char* executablePath) {
+void test_checkpoint_crash(const char* executablePath, bool reduceHistory) {
 #ifdef ZENTHRILDB_ENABLE_FAULT_INJECTION
   const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
   const auto directory = std::filesystem::temp_directory_path() /
@@ -148,8 +148,8 @@ void test_checkpoint_crash(const char* executablePath) {
   }
   const std::vector<Byte> value{9, 2, 4};
   for (const auto& phase : kPhases) {
-    const auto database = directory / (std::string(phase.name) + ".zdb");
-    const auto wal = databaseWalPath(database);
+    const auto source = directory / (std::string(phase.name) + ".zdb");
+    auto database = source;
     std::uint64_t walRecordsBefore = 0;
     {
       DatabaseRuntime runtime(database, true);
@@ -157,6 +157,14 @@ void test_checkpoint_crash(const char* executablePath) {
       runtime.records().put("records", "confirmed", value);
       walRecordsBefore = runtime.checkConsistency().walRecordsChecked;
     }
+    const auto reducedDirectory = directory / (std::string(phase.name) + "-reduced");
+    if (reduceHistory) {
+      DatabaseRuntime::reduceWalTo(source, reducedDirectory);
+      database = reducedDirectory / source.filename();
+      DatabaseRuntime runtime(database);
+      walRecordsBefore = runtime.checkConsistency().walRecordsChecked;
+    }
+    const auto wal = databaseWalPath(database);
     const auto walBefore = readFixture(wal);
     const auto databaseBefore = readFixture(database);
     runCrashProcess(executablePath, database, phase.name);
@@ -188,9 +196,14 @@ void test_checkpoint_crash(const char* executablePath) {
     }
     assert(readFixture(database) == databaseBefore);
     removeTestDatabaseArtifacts(database);
+    if (reduceHistory) {
+      std::filesystem::remove(reducedDirectory);
+      removeTestDatabaseArtifacts(source);
+    }
   }
   std::filesystem::remove(directory);
 #else
   (void)executablePath;
+  (void)reduceHistory;
 #endif
 }

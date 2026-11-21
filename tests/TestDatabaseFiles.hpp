@@ -14,4 +14,6 @@ inline void removeTestDatabaseArtifacts(const std::filesystem::path& databasePat
   auto lockPath = databasePath;
   lockPath += ".lock";
   std::filesystem::remove(lockPath, ignored);
+  auto walLock = zenthrildb::databaseWalPath(databasePath); walLock += ".lock";
+  std::filesystem::remove(walLock, ignored);
 }

@@ -24,7 +24,7 @@ std::array<Byte, DatabaseHeader::serializedSize()> checksumHeader(DatabaseHeader
 void writeGrowth(const std::filesystem::path& path, Byte value, bool commit, PageId pages) {
   FileManager files;
   files.openDatabase(path);
-  LogManager wal(databaseWalPath(path));
+  LogManager wal(databaseWalPath(path), files.ownership());
   TransactionManager transactions(wal);
   const auto transaction = transactions.begin();
 

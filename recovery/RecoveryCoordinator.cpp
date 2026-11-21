@@ -5,6 +5,7 @@
 #include "recovery/PageImageRecoveryApplier.hpp"
 #include "recovery/RecoveryEngine.hpp"
 #include "storage/IoFaultInjector.hpp"
+#include "storage/DatabaseWalPath.hpp"
 #include "wal/LogManager.hpp"
 #include "wal/LogPayload.hpp"
 
@@ -76,7 +77,12 @@ RecoveryPlan physicalPlanFor(const RecoveryContext& context, SnapshotBaseline* b
 std::unique_ptr<SnapshotBaseline> loadBaseline(const std::filesystem::path& database,
                                               const std::filesystem::path& wal,
                                               FileManager& files, const RecoveryContext& context) {
-  if (!SnapshotBaseline::existsFor(database)) return {};
+  if (!SnapshotBaseline::existsFor(database)) {
+    if (files.walIdentity() && files.walIdentity()->baselineRequired) {
+      throw std::runtime_error("This database generation requires its snapshot manifest and baseline");
+    }
+    return {};
+  }
   auto baseline = std::make_unique<SnapshotBaseline>(database);
   if (files.walIdentity() != std::optional{baseline->manifest().identity}) {
     throw std::runtime_error("Snapshot manifest does not match the working database identity");
@@ -88,6 +94,11 @@ std::unique_ptr<SnapshotBaseline> loadBaseline(const std::filesystem::path& data
 } // namespace
 
 RecoverySummary RecoveryCoordinator::recover(LogManager& logManager, FileManager& fileManager) const {
+  auto operation = fileManager.operation();
+  if (fileManager.walIdentity() && std::filesystem::absolute(logManager.wal_.path()).lexically_normal() !=
+      std::filesystem::absolute(databaseWalPath(fileManager.path_)).lexically_normal()) {
+    throw std::logic_error("Recovery WAL does not belong to the owned database path");
+  }
   if (logManager.isBound() != fileManager.walIdentity().has_value() ||
       (fileManager.walIdentity() && (!logManager.paired_ || logManager.identity_ != fileManager.walIdentity()))) {
     throw std::runtime_error("Recovery requires a WAL validated against the database identity");
